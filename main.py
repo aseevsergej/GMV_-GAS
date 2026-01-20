@@ -23,48 +23,31 @@ def send_to_gas(payload):
     try: requests.post(GAS_WEBAPP_URL, json=payload, timeout=10)
     except: pass
 
-# --- OZON CARDS (МЕТОД v3) ---
+# --- OZON CARDS (v3 -> v2) ---
 def fetch_cards(cid, key):
     items = []
-    print(f"📦 Start Cards {cid}...")
-    
-    # Сначала пробуем v3 (актуальный в 2026)
-    # Если не выйдет - v2
-    endpoints = [
-        "https://api-seller.ozon.ru/v3/product/list",
-        "https://api-seller.ozon.ru/v2/product/list"
-    ]
+    # Сначала v3 (новый), если нет - v2
+    endpoints = ["https://api-seller.ozon.ru/v3/product/list", "https://api-seller.ozon.ru/v2/product/list"]
     
     last_id = ""
-    
     for url in endpoints:
         has_error = False
         while True:
-            # Для v3/v2 payload одинаковый
-            payload = { 
-                "filter": { "visibility": "ALL" }, 
-                "limit": 1000 
-            }
+            payload = { "filter": { "visibility": "ALL" }, "limit": 1000 }
             if last_id: payload["last_id"] = last_id
             
             try:
                 r = requests.post(url, headers=get_headers(cid, key), json=payload)
-                
                 if r.status_code != 200:
-                    # Если этот урл не сработал, прерываем цикл пагинации и идем к следующему урлу
-                    if page_idx == 0: # Только если это первая страница
-                         send_to_gas({"type": "LOG", "msg": f"Try {url.split('/')[-3]}: {r.status_code}"})
                     has_error = True
                     break
                 
                 data = r.json().get("result", {}).get("items", [])
-                if not data: break # Данные кончились или пусто
+                if not data: break
                 
-                # Получаем детали (Info)
-                # Для v3 product/list возвращает product_id, но для Info v2 все еще актуален
                 ids = [i["product_id"] for i in data]
-                
                 r_info = requests.post("https://api-seller.ozon.ru/v2/product/info/list", headers=get_headers(cid, key), json={"product_id": ids})
+                
                 info_map = {}
                 if r_info.status_code == 200:
                     for i in r_info.json().get("result", {}).get("items", []):
@@ -74,37 +57,26 @@ def fetch_cards(cid, key):
                     pid = item_base["product_id"]
                     full = info_map.get(pid, {})
                     offer_id = full.get("offer_id") or item_base.get("offer_id") or ""
-                    
                     p = float(full.get("price", {}).get("price", 0))
                     mp = float(full.get("price", {}).get("marketing_price", 0) or p)
                     st = full.get("stocks", {}).get("present", 0)
                     
+                    # [Фото, nmID, АртOZ, АртПрод, Бренд, Кат, Назв, Ц.База, Ц.Прод, Ц.СПП, Ост]
                     items.append([
-                        full.get("primary_image", ""), 
-                        str(pid), str(pid), offer_id,
+                        full.get("primary_image", ""), str(pid), str(pid), offer_id,
                         "OZON", str(full.get("category_id", "")), full.get("name", f"ID {pid}"), 
                         p, mp, mp, st
                     ])
                 
                 last_id = data[-1]["product_id"]
-                if len(data) < 1000: 
-                    return items # Успех, возвращаем все что есть
+                if len(data) < 1000: return items 
                 
-            except Exception as e:
-                has_error = True
-                break
-        
-        # Если первый урл сработал и вернул данные (или успешно прошел), выходим
+            except: has_error = True; break
         if items and not has_error: return items
-        # Если была ошибка на v3, цикл перейдет к v2
-    
-    # Если ничего не помогло
-    if not items:
-        send_to_gas({"type": "LOG", "msg": f"OZ {cid}: Cards Failed (All Methods)"})
             
     return items
 
-# --- OZON STOCK ---
+# --- OZON STOCK (Real Warehouses) ---
 def fetch_stocks(cid, key):
     items = []
     try:
@@ -112,9 +84,21 @@ def fetch_stocks(cid, key):
         if r.status_code == 200:
             rows = r.json().get("result", {}).get("rows", [])
             for row in rows:
-                whs = row.get("warehouses") or []
-                total = sum(w.get("item_cnt",0) for w in whs)
-                items.append(["FBO Ozon", row.get("item_code"), total, 0, str(row.get("sku"))])
+                sku = str(row.get("sku"))
+                item_code = row.get("item_code")
+                # Разбиваем по складам
+                warehouses = row.get("warehouses", [])
+                if not warehouses:
+                    # Если складов нет, но есть товар (редко)
+                    items.append(["FBO Ozon", item_code, 0, 0, sku])
+                else:
+                    for wh in warehouses:
+                        wh_name = wh.get("warehouse_name", "Ozon Wh")
+                        # Берем "present" или "item_cnt" (доступное к продаже)
+                        qty = wh.get("item_cnt", 0) 
+                        if qty > 0:
+                            # [Склад, Арт, Ост, Путь, nmID]
+                            items.append([wh_name, item_code, qty, 0, sku])
     except: pass
     return items
 
@@ -122,28 +106,34 @@ def fetch_stocks(cid, key):
 def fetch_sales(cid, key, d_from, d_to):
     items = []
     page = 1
-    since_dt = f"{d_from}T00:00:00Z"
-    to_dt = f"{d_to}T23:59:59Z"
-
     while True:
         try:
-            payload = { "filter": { "since": since_dt, "to": to_dt }, "limit": 1000, "page": page }
+            payload = { "filter": { "since": f"{d_from}T00:00:00Z", "to": f"{d_to}T23:59:59Z" }, "limit": 1000, "page": page }
             r = requests.post("https://api-seller.ozon.ru/v2/posting/fbo/list", headers=get_headers(cid, key), json=payload)
             if r.status_code != 200: break
-            
-            res = r.json().get("result")
+            res = r.json().get("result", [])
             if not res or not isinstance(res, list): break
             
             for p in res:
                 created = p.get("created_at") or "2000-01-01T00:00:00Z"
                 status = "Отмена" if "cancelled" in (p.get("status") or "").lower() else "Заказ"
-                wh = (p.get("analytics_data") or {}).get("warehouse_name", "Ozon")
                 
-                products = p.get("products") or []
-                for prod in products:
+                # Получаем реальное имя склада
+                analytics = p.get("analytics_data") or {}
+                wh = analytics.get("warehouse_name", "Ozon")
+                if not wh: wh = "Ozon"
+                
+                reg = analytics.get("region", "RU")
+                num = p.get("posting_number", "")
+
+                for prod in p.get("products", []):
                     price = float(prod.get("price", 0))
-                    items.append([created[:10], created[11:16], status, prod.get("offer_id"), str(prod.get("sku")), 1, price, price, price, 0, wh, "RU", p.get("posting_number")])
-            
+                    # [Дата, Время, Тип, Арт, nmID, Кол, Ц.Розн, Ц.Прод, Ц.Факт, СПП, Склад, Регион, №]
+                    items.append([
+                        created[:10], created[11:16], status, 
+                        prod.get("offer_id"), str(prod.get("sku")), 
+                        1, price, price, price, 0, wh, reg, num
+                    ])
             if len(res) < 1000: break
             page += 1
             time.sleep(0.2)
@@ -151,25 +141,17 @@ def fetch_sales(cid, key, d_from, d_to):
     return items
 
 @app.route("/")
-def health(): return "Ozon v91 OK", 200
+def health(): return "Ozon v92 OK", 200
 
 @app.route("/sync", methods=['POST'])
 def sync():
     try:
         data = request.json
-        if not data: return jsonify({"error": "No JSON"}), 400
-        
         cid = data.get("clientId")
         key = data.get("apiKey")
         mode = data.get("mode")
-        d_from = data.get("dateFrom")
-        d_to = data.get("dateTo")
         
-        if not cid or not key:
-            send_to_gas({"type": "LOG", "msg": "Py: Keys Missing"})
-            return jsonify({"error": "Keys missing"}), 400
-
-        # send_to_gas({"type": "LOG", "msg": f"Py: {mode} {cid}..."})
+        if not cid or not key: return jsonify({"error": "Keys missing"}), 400
 
         rows = []
         target = ""
@@ -181,7 +163,7 @@ def sync():
             rows = fetch_stocks(cid, key)
             target = "OZ_STOCK_PY"
         elif mode == "SALES":
-            rows = fetch_sales(cid, key, d_from, d_to)
+            rows = fetch_sales(cid, key, data.get("dateFrom"), data.get("dateTo"))
             target = "OZ_SALES_PY"
         elif mode == "FUNNEL":
             return jsonify({"status": "empty"}), 200
@@ -189,8 +171,7 @@ def sync():
         if rows:
             send_to_gas({"type": "DATA", "sheetName": target, "rows": rows})
             return jsonify({"status": "ok", "count": len(rows)}), 200
-        else:
-            return jsonify({"status": "empty"}), 200
+        return jsonify({"status": "empty"}), 200
             
     except Exception as e:
         return jsonify({"error": str(e)}), 500
