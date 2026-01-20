@@ -1,13 +1,16 @@
 import os
 import time
 import requests
-from flask import Flask, jsonify, Response
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
 # --- КОНФИГУРАЦИЯ ---
 OZON_CLIENT_ID = os.environ.get("OZON_CLIENT_ID")
 OZON_API_KEY = os.environ.get("OZON_API_KEY")
+# Сюда вставим URL, который получили в Google Apps Script
+GAS_WEBAPP_URL = os.environ.get("GAS_WEBAPP_URL") 
+SECRET_KEY = "MY_SUPER_SECRET_PASSWORD_123" # Тот же пароль, что в GAS
 
 def get_ozon_headers():
     return {
@@ -16,92 +19,76 @@ def get_ozon_headers():
         "Content-Type": "application/json"
     }
 
-@app.route("/")
-def health_check():
-    return "Ozon Data Provider is Ready!", 200
-
-@app.route("/get-ozon-cards")
-def get_cards():
-    """Скачивает товары и отдает их как JSON для Google Apps Script"""
-    
-    # Проверка ключей
-    if not OZON_CLIENT_ID or not OZON_API_KEY:
-        return jsonify({"error": "Ozon keys are missing on server"}), 500
-
+def fetch_ozon_data():
     all_items = []
     last_id = ""
+    print("🚀 Fetching Ozon...")
     
-    # --- СБОР ДАННЫХ С OZON ---
-    try:
-        while True:
-            payload = { "filter": { "visibility": "ALL" }, "limit": 100 }
-            if last_id: payload["last_id"] = last_id
+    while True:
+        payload = { "filter": { "visibility": "ALL" }, "limit": 100 }
+        if last_id: payload["last_id"] = last_id
             
-            # 1. Список
-            resp = requests.post(
-                "https://api-seller.ozon.ru/v2/product/list",
-                headers=get_ozon_headers(),
-                json=payload,
-                timeout=20
-            )
-            if resp.status_code != 200:
-                print(f"Ozon List Error: {resp.text}")
-                break
-                
+        try:
+            resp = requests.post("https://api-seller.ozon.ru/v2/product/list", headers=get_ozon_headers(), json=payload, timeout=30)
             data = resp.json().get("result", {}).get("items", [])
             if not data: break
                 
-            # 2. Детали (Info)
-            product_ids = [item["product_id"] for item in data]
-            info_resp = requests.post(
-                "https://api-seller.ozon.ru/v2/product/info/list",
-                headers=get_ozon_headers(),
-                json={"product_id": product_ids},
-                timeout=20
-            )
+            p_ids = [i["product_id"] for i in data]
+            info_resp = requests.post("https://api-seller.ozon.ru/v2/product/info/list", headers=get_ozon_headers(), json={"product_id": p_ids}, timeout=30)
+            info_data = info_resp.json().get("result", {}).get("items", [])
             
-            info_items = []
-            if info_resp.status_code == 200:
-                info_items = info_resp.json().get("result", {}).get("items", [])
-            else:
-                # Если Info не сработал, берем хотя бы ID из списка
-                info_items = data 
-
-            # Обработка
-            for item in info_items:
-                # Безопасное получение цены (если Info не сработал, там может не быть price)
-                price_obj = item.get("price", {})
-                price = float(price_obj.get("price", 0) if price_obj else 0)
-                m_price = float(price_obj.get("marketing_price", 0) if price_obj else 0)
-                if m_price == 0: m_price = price
-                
+            for item in info_data:
+                price = float(item.get("price", {}).get("price", 0))
+                m_price = float(item.get("price", {}).get("marketing_price", 0) or price)
                 stocks = item.get("stocks", {}).get("present", 0)
                 
-                # Формируем строку для таблицы
+                # Формируем строку таблицы. 
+                # Порядок должен совпадать с тем, что вы ожидаете в Google Sheets
                 row = [
-                    item.get("primary_image", ""),      # Фото
-                    str(item.get("id", item.get("product_id", ""))), # nmID (Ozon ID)
-                    str(item.get("id", item.get("product_id", ""))), # Артикул WB (дубль)
-                    str(item.get("offer_id", "")),      # Артикул Прод
-                    "OZON",                             # Бренд
-                    str(item.get("category_id", "")),   # Категория
-                    item.get("name", "Товар Ozon"),     # Название
-                    price,                              # Цена
-                    m_price,                            # Цена Прод
-                    m_price,                            # Цена СПП
-                    stocks                              # Остаток
+                    item.get("primary_image", ""),
+                    str(item.get("id", "")),
+                    str(item.get("id", "")),
+                    str(item.get("offer_id", "")),
+                    "OZON", 
+                    str(item.get("category_id", "")),
+                    item.get("name", ""),
+                    price,
+                    m_price,
+                    m_price,
+                    stocks
                 ]
                 all_items.append(row)
             
             last_id = data[-1]["product_id"]
             if len(data) < 100: break
-            time.sleep(0.3)
+            time.sleep(0.5)
             
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            break
+            
+    return all_items
+
+@app.route("/sync")
+def sync_ozon():
+    if not OZON_API_KEY or not GAS_WEBAPP_URL:
+        return jsonify({"error": "Env vars missing"}), 500
+        
+    rows = fetch_ozon_data()
+    if not rows: return jsonify({"status": "No data"}), 200
+    
+    # Отправляем в Google Script
+    payload = {
+        "sheetName": "OZ_CARDS_PY", # Имя листа, куда вставлять
+        "rows": rows,
+        "secret": SECRET_KEY
+    }
+    
+    try:
+        r = requests.post(GAS_WEBAPP_URL, json=payload, allow_redirects=True)
+        return jsonify({"ozon_count": len(rows), "google_response": r.text}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-    # Отдаем чистый JSON с массивом данных
-    return jsonify({"data": all_items})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
