@@ -9,14 +9,13 @@ app = Flask(__name__)
 
 GAS_WEBAPP_URL = os.environ.get("GAS_WEBAPP_URL", "")
 SECRET_KEY = "MY_SUPER_SECRET_PASSWORD_123"
-START_TIME = time.time() # Время старта сервера
 
 def get_headers(cid, key):
     return {
         "Client-Id": str(cid).strip(), 
         "Api-Key": str(key).strip(),
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
     }
 
 def send_to_gas(payload):
@@ -25,9 +24,11 @@ def send_to_gas(payload):
     try: requests.post(GAS_WEBAPP_URL, json=payload, timeout=10)
     except: pass
 
-# --- OZON CARDS (Товары) ---
+# --- OZON PRODUCTS (ТОВАРЫ) ---
 def fetch_cards(cid, key):
     items = []
+    print(f"📦 Start Cards {cid}...")
+    
     url_list = "https://api-seller.ozon.ru/v2/product/list"
     url_info = "https://api-seller.ozon.ru/v2/product/info/list"
     last_id = ""
@@ -35,19 +36,21 @@ def fetch_cards(cid, key):
     while True:
         try:
             # 1. Список ID
-            payload = { "filter": { "visibility": "ALL" }, "limit": 200 }
+            payload = { "filter": { "visibility": "ALL" }, "limit": 500 }
             if last_id: payload["last_id"] = last_id
             
             r = requests.post(url_list, headers=get_headers(cid, key), json=payload)
-            if r.status_code != 200: break
+            if r.status_code != 200: 
+                send_to_gas({"type": "LOG", "msg": f"OZ Cards Err: {r.status_code}"})
+                break
             
             data = r.json().get("result", {}).get("items", [])
             if not data: break
             
-            # 2. Детали
             ids = [i["product_id"] for i in data]
-            r_info = requests.post(url_info, headers=get_headers(cid, key), json={"product_id": ids})
             
+            # 2. Детали (Info)
+            r_info = requests.post(url_info, headers=get_headers(cid, key), json={"product_id": ids})
             info_map = {}
             if r_info.status_code == 200:
                 for i in r_info.json().get("result", {}).get("items", []):
@@ -57,56 +60,48 @@ def fetch_cards(cid, key):
                 pid = item_base["product_id"]
                 full = info_map.get(pid, {})
                 
-                offer_id = full.get("offer_id") or item_base.get("offer_id") or ""
-                name = full.get("name") or "Без названия"
-                cat_id = full.get("category_id") or ""
+                # Поля по ТЗ
+                photo = full.get("primary_image") or ""
+                if not photo and full.get("images"): photo = full["images"][0]
                 
-                # Фото
-                images = full.get("images", [])
-                primary_img = full.get("primary_image") or (images[0] if images else "")
+                ozon_id = str(pid) # Артикул Ozon
+                vendor_code = full.get("offer_id") or "" # Наш Артикул
                 
-                # Бренд (Пытаемся найти в атрибутах)
-                # Ozon передает атрибуты сложно, но часто "brand" это просто текст
-                # Если нет, ставим Ozon, чтобы не ломать логику
-                brand = "No Brand" 
-                # (Тут можно добавить сложный парсинг атрибутов, но пока берем заглушку если нет явного поля)
+                # Бренд - Ozon часто не отдает его явно, пробуем найти
+                brand = "Не указан"
+                # Обычно бренд лежит в attributes, но это сложный запрос. Пока берем заглушку или из названия.
+                
+                cat = full.get("category_id") or ""
+                name = full.get("name") or ""
                 
                 # Цены
                 # Цена до скидки (old_price)
-                p_old = float(full.get("old_price") or full.get("price") or 0)
-                # Цена с учетом скидок продавца (marketing_price или price)
-                p_marketing = float(full.get("marketing_price") or full.get("price") or 0)
-                # Цена для покупателя (часто совпадает с marketing, если нет Ozon карты)
-                p_final = p_marketing
+                price_old = float(full.get("old_price") or full.get("price", {}).get("price") or 0)
+                # Цена продавца (после скидки селлера)
+                price_seller = float(full.get("price") or 0)
+                # Цена для покупателя (маркетинговая)
+                price_marketing = float(full.get("marketing_price") or price_seller)
                 
-                stocks = full.get("stocks", {}).get("present", 0)
-                
-                # Порядок для GAS:
-                # [Фото, Арт.OZ (nmID), Арт.OZ, Арт.Наш, Бренд, Категория, Название, Цена До, Цена ЛК, Цена Клиент, Остаток]
+                # Цена по Ozon карте (обычно ~ маркетинговая, точнее только через отчеты)
+                price_ozon_card = price_marketing 
+
+                # Структура для GAS: 
+                # [Фото, Арт.OZ, Арт.Наш, Бренд, Категория, Название, Ц.ДоСкидки, Ц.Селлера, Ц.Покупателя, Ц.OzonКарта]
                 items.append([
-                    primary_img, 
-                    str(pid), 
-                    str(pid), 
-                    offer_id,
-                    brand, 
-                    str(cat_id), 
-                    name, 
-                    p_old, 
-                    p_marketing, 
-                    p_final, 
-                    stocks
+                    photo, ozon_id, vendor_code, brand, str(cat), name,
+                    price_old, price_seller, price_marketing, price_ozon_card
                 ])
             
             last_id = data[-1]["product_id"]
-            if len(data) < 200: break
+            if len(data) < 500: break
             
         except Exception as e:
-            send_to_gas({"type": "LOG", "msg": f"Cards err: {e}"})
+            send_to_gas({"type": "LOG", "msg": f"Cards Crash: {e}"})
             break
             
     return items
 
-# --- OZON STOCK (Остатки) ---
+# --- OZON STOCKS (ОСТАТКИ ПО СКЛАДАМ) ---
 def fetch_stocks(cid, key):
     items = []
     try:
@@ -114,24 +109,26 @@ def fetch_stocks(cid, key):
         if r.status_code == 200:
             rows = r.json().get("result", {}).get("rows", [])
             for row in rows:
-                sku = str(row.get("sku"))
-                # item_code = row.get("item_code") # Наш артикул
+                vendor_code = row.get("item_code") # Наш артикул
                 
                 warehouses = row.get("warehouses", [])
+                if not warehouses: continue
+                
                 for wh in warehouses:
+                    # ТЗ: Склад (где находится), Артикул, Остаток
                     wh_name = wh.get("warehouse_name", "Склад Ozon")
-                    qty = wh.get("item_cnt", 0) # Фактический остаток доступный к продаже
+                    qty = wh.get("item_cnt", 0) # Фактический остаток
                     
                     if qty > 0:
-                        # [Склад, Арт.OZ, Остаток, Путь(0), nmID(Арт.OZ)] - формат как у WB для унификации
-                        items.append([wh_name, sku, qty, 0, sku])
+                        items.append([wh_name, vendor_code, qty])
     except: pass
     return items
 
-# --- OZON SALES (Продажи) ---
+# --- OZON SALES (ПРОДАЖИ) ---
 def fetch_sales(cid, key, d_from, d_to):
     items = []
     page = 1
+    # Формат дат RFC3339
     since_dt = f"{d_from}T00:00:00Z"
     to_dt = f"{d_to}T23:59:59Z"
 
@@ -141,7 +138,7 @@ def fetch_sales(cid, key, d_from, d_to):
                 "filter": { "since": since_dt, "to": to_dt }, 
                 "limit": 1000, 
                 "page": page,
-                "with": { "analytics_data": True, "financial_data": True } 
+                "with": { "analytics_data": True, "financial_data": True } # Важно для цен и кластеров
             }
             r = requests.post("https://api-seller.ozon.ru/v2/posting/fbo/list", headers=get_headers(cid, key), json=payload)
             
@@ -150,37 +147,43 @@ def fetch_sales(cid, key, d_from, d_to):
             if not res: break
             
             for p in res:
-                created = p.get("created_at")
-                if not created: continue
+                created = p.get("created_at") or "2000-01-01T00:00:00Z"
+                status_raw = p.get("status") or ""
                 
-                # Тип: Заказ или Отмена
-                status_raw = (p.get("status") or "").lower()
-                op_type = "Отмена" if "cancelled" in status_raw else "Заказ"
+                # Тип: Продажа или Отмена
+                typ = "Отмена" if "cancelled" in status_raw.lower() else "Продажа"
                 
-                # Склады
                 analytics = p.get("analytics_data") or {}
-                wh_from = analytics.get("warehouse_name") or analytics.get("warehouse") or "Склад Ozon"
-                wh_to = analytics.get("region") or analytics.get("city") or "RU" # Склад доставки/Регион
-                
-                posting_number = p.get("posting_number", "")
-
-                products = p.get("products") or []
                 financial = p.get("financial_data") or {}
                 
+                # Склады
+                wh_ship = analytics.get("warehouse_name") or "Ozon FBO" # Склад отгрузки
+                wh_deliv = analytics.get("region") or "RF" # Склад доставки (обычно регион/кластер)
+                
+                products = p.get("products") or []
+                financial_prods = financial.get("products") or []
+                
+                # Создаем мапу финансовых данных по product_id (sku)
+                fin_map = {fp.get("product_id"): fp for fp in financial_prods}
+
                 for prod in products:
-                    # Цена продажи (сколько платит покупатель)
-                    price = float(prod.get("price", 0))
+                    sku = prod.get("sku")
+                    fin_data = fin_map.get(sku) or {}
                     
-                    # [Дата, Время, Тип, Арт.Наш, Арт.OZ, Кол, Ц.Прод, Ц.Прод, Ц.Прод, СПП(0), Склад Отгр, Склад Дост, Номер]
+                    # Цена продажи (сколько оплатил покупатель)
+                    # Если есть client_price - берем её, иначе price
+                    sale_price = float(fin_data.get("client_price") or prod.get("price") or 0)
+                    
+                    # ТЗ: Дата, Тип, Арт(Наш), Арт(Ozon), Кол-во, Цена, СкладОтгр, СкладДост
                     items.append([
-                        created[:10], created[11:16], 
-                        op_type, 
-                        prod.get("offer_id"), 
-                        str(prod.get("sku")), 
-                        1, 
-                        price, price, price, 0, 
-                        wh_from, wh_to, 
-                        posting_number
+                        created[:10], # Дата
+                        typ,          # Тип
+                        prod.get("offer_id"), # Арт Наш
+                        str(sku),     # Арт Ozon
+                        1,            # Кол-во
+                        sale_price,   # Цена продажи
+                        wh_ship,      # Склад отгрузки
+                        wh_deliv      # Склад доставки (Регион)
                     ])
             
             if len(res) < 1000: break
@@ -190,9 +193,7 @@ def fetch_sales(cid, key, d_from, d_to):
     return items
 
 @app.route("/")
-def health(): 
-    uptime = time.time() - START_TIME
-    return jsonify({"status": "Ozon v95 OK", "uptime_sec": int(uptime)}), 200
+def health(): return "Ozon v95 OK", 200
 
 @app.route("/sync", methods=['POST'])
 def sync():
