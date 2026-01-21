@@ -9,7 +9,7 @@ app = Flask(__name__)
 GAS_WEBAPP_URL = os.environ.get("GAS_WEBAPP_URL", "")
 SECRET_KEY = "MY_SUPER_SECRET_PASSWORD_123"
 
-# --- ЛОГИРОВАНИЕ ---
+# --- LOGGING ---
 def send_log(msg):
     if not GAS_WEBAPP_URL: return
     try:
@@ -22,234 +22,201 @@ def send_data(sheet, rows):
         requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "DATA", "sheetName": sheet, "rows": rows}, timeout=45)
     except: pass
 
-# --- ЗАГОЛОВКИ ---
+# --- HEADERS ---
 def get_headers(cid, key):
-    c_clean = str(cid).strip().replace('"', '').replace("'", "")
-    k_clean = str(key).strip().replace('"', '').replace("'", "")
     return {
-        "Client-Id": c_clean, 
-        "Api-Key": k_clean,
+        "Client-Id": str(cid).strip().replace('"', '').replace("'", ""),
+        "Api-Key": str(key).strip().replace('"', '').replace("'", ""),
         "Content-Type": "application/json",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-# --- УНИВЕРСАЛЬНЫЙ POST ---
-def post_req(url, headers, payload, label):
+# --- HELPER: POST WITH FAIL-SAFE ---
+def safe_post(url, headers, payload, label):
     try:
         r = requests.post(url, headers=headers, json=payload)
         if r.status_code == 200:
             return r.json()
+        elif r.status_code == 404:
+            send_log(f"OZ {label} 404 (Not Found). URL: {url}")
+            return None
         else:
-            # Логируем ошибку, но коротко
-            send_log(f"OZ {label} ERR {r.status_code}. Msg: {r.text[:200]}")
+            send_log(f"OZ {label} ERR {r.status_code}: {r.text[:200]}")
             return None
     except Exception as e:
-        send_log(f"OZ {label} Ex: {str(e)}")
+        send_log(f"OZ {label} Ex: {e}")
         return None
 
-# --- ПОИСК БРЕНДА ---
-def extract_brand(attributes):
-    for a in attributes:
+# --- BRAND EXTRACTOR ---
+def get_brand(attrs):
+    for a in attrs:
         if a.get("attribute_id") in [85, 31]:
             vals = a.get("values", [])
             if vals: return vals[0].get("value", "")
     return ""
 
-# --- OZON CARDS (v3 List + v3 Attr + v4 Price) ---
+# --- MAIN: CARDS (Robust) ---
 def fetch_cards(cid, key):
     items = []
     headers = get_headers(cid, key)
     
-    # URLS
-    url_list = "https://api-seller.ozon.ru/v3/product/list"
-    url_attr = "https://api-seller.ozon.ru/v3/products/info/attributes"
-    url_price = "https://api-seller.ozon.ru/v4/product/info/prices"
+    # Endpoints
+    URL_LIST_V3 = "https://api-seller.ozon.ru/v3/product/list"
+    URL_INFO_V2 = "https://api-seller.ozon.ru/v2/product/info/list"
     
-    last_id = "" # В v3 это строковый токен
+    last_id = "" # V3 token (string)
 
     while True:
-        # 1. СПИСОК (List v3)
-        payload_list = { 
-            "filter": { "visibility": "ALL" }, 
-            "limit": 100
-        }
-        if last_id: payload_list["last_id"] = last_id
+        # 1. GET LIST (V3)
+        payload = { "filter": { "visibility": "ALL" }, "limit": 100 }
+        if last_id: payload["last_id"] = last_id
         
-        resp_list = post_req(url_list, headers, payload_list, "ListV3")
-        if not resp_list: break
+        resp = safe_post(URL_LIST_V3, headers, payload, "ListV3")
+        if not resp: break
         
-        # Получаем items и новый last_id из корня result
-        result = resp_list.get("result", {})
+        result = resp.get("result", {})
         data_list = result.get("items", [])
         new_last_id = result.get("last_id", "")
         
         if not data_list: break
         
-        # Собираем ID (строго int)
-        ids = [int(i.get("product_id")) for i in data_list]
+        # Collect IDs (int)
+        ids = [int(x.get("product_id")) for x in data_list]
         
-        info_map = {} # Сюда сложим данные из атрибутов и цен
-        
-        # 2. АТРИБУТЫ (v3)
-        # Убрали visibility из фильтра, оставили только product_id
-        payload_attr = {
-            "filter": { "product_id": ids },
-            "limit": 100
-        }
-        resp_attr = post_req(url_attr, headers, payload_attr, "AttrV3")
-        if resp_attr:
-            for item in resp_attr.get("result", []):
-                info_map[item.get("id")] = item
+        # 2. GET DETAILS (V2 Mass)
+        info_map = {}
+        if ids:
+            # Try V2 Info List
+            resp_info = safe_post(URL_INFO_V2, headers, {"product_id": ids}, "InfoV2")
+            
+            if resp_info:
+                for i in resp_info.get("result", {}).get("items", []):
+                    info_map[i.get("id")] = i
+            else:
+                send_log("Warning: Details failed. Loading basic data only.")
+                # Fallback: Try fetching just ONE item to verify access (debug)
+                try:
+                    one_url = "https://api-seller.ozon.ru/v2/product/info"
+                    one_resp = requests.post(one_url, headers=headers, json={"product_id": ids[0]})
+                    if one_resp.status_code == 200:
+                        send_log(f"DEBUG: Single Item Access OK! Mass info is broken.")
+                    else:
+                        send_log(f"DEBUG: Single Item Access Also Failed: {one_resp.status_code}")
+                except: pass
 
-        # 3. ЦЕНЫ (v4)
-        payload_price = {
-            "filter": { "product_id": ids },
-            "limit": 100
-        }
-        resp_price = post_req(url_price, headers, payload_price, "PriceV4")
-        if resp_price:
-            for item in resp_price.get("result", {}).get("items", []):
-                pid = item.get("product_id")
-                if pid not in info_map: info_map[pid] = {}
-                info_map[pid]["price_info"] = item.get("price", {})
-
-        # 4. СБОРКА
+        # 3. BUILD ROWS (Even if info missing)
         for basic in data_list:
             pid = int(basic.get("product_id"))
             
-            # Данные из списка
-            offer_id = basic.get("offer_id")
-            ozon_id = str(pid)
+            # If info failed, we use what we have from 'basic' (Offer ID)
+            # 'basic' structure in V3 list: { "product_id": 123, "offer_id": "art-001" }
             
-            # Данные из InfoMap
+            # Merge with info if available
             details = info_map.get(pid, {})
             
-            name = details.get("name") or "Товар"
-            cat_id = str(details.get("category_id", ""))
+            # Fields
+            offer_id = details.get("offer_id") or basic.get("offer_id") or "NoOfferID"
+            ozon_id = str(pid)
             
-            # Фото
-            primary = ""
-            imgs = details.get("images", [])
-            if imgs:
-                # В v3 images - это список объектов {file_name, ...}
-                if isinstance(imgs[0], dict): primary = imgs[0].get("file_name", "")
-                elif isinstance(imgs[0], str): primary = imgs[0]
+            name = details.get("name") or "Товар (нет деталей)"
+            cat = str(details.get("category_id", ""))
+            brand = get_brand(details.get("attributes", []))
             
-            brand = extract_brand(details.get("attributes", []))
-            
-            # Цены
-            prices = details.get("price_info", {})
-            def get_p(k): return float(prices.get(k) or 0)
-            
-            p_old = get_p("old_price")
-            p_sell = get_p("price")
-            p_mkt = get_p("marketing_price")
+            # Photos
+            primary = details.get("primary_image") or ""
+            if not primary and details.get("images"):
+                imgs = details.get("images")
+                primary = imgs[0] if isinstance(imgs[0], str) else imgs[0].get("file_name","")
+
+            # Prices
+            def gp(k): return float(details.get(k) or details.get("price", {}).get(k) or 0)
+            p_old = gp("old_price")
+            p_sell = gp("price")
+            p_mkt = gp("marketing_price")
             
             if p_old == 0: p_old = p_sell
             if p_mkt == 0: p_mkt = p_sell
             
-            items.append([
-                primary, ozon_id, offer_id, brand, cat_id, name, p_old, p_sell, p_mkt, p_mkt
-            ])
-        
-        # Пагинация
+            # [Photo, ArtOZ, ArtMy, Brand, Cat, Name, PriceOld, PriceSell, PriceMkt, PriceCard]
+            items.append([primary, ozon_id, offer_id, brand, cat, name, p_old, p_sell, p_mkt, p_mkt])
+
+        # Pagination
         last_id = new_last_id
-        if not last_id: break # Если токена нет, значит конец
-        if len(data_list) < 100: break # Или если пришло меньше лимита
-            
+        if not last_id: break
+        if len(data_list) < 100: break
+
     return items
 
-# --- OZON STOCK (v2) ---
+# --- STOCK & SALES (No Changes) ---
 def fetch_stocks(cid, key):
     items = []
     headers = get_headers(cid, key)
     url = "https://api-seller.ozon.ru/v2/analytics/stock_on_warehouses"
-    
-    resp = post_req(url, headers, {"limit": 1000, "offset": 0}, "Stock")
+    resp = safe_post(url, headers, {"limit": 1000, "offset": 0}, "Stock")
     if resp:
-        rows = resp.get("result", {}).get("rows", [])
-        for row in rows:
-            sku = str(row.get("sku", ""))
-            offer_id = row.get("item_code") or sku
-            for wh in row.get("warehouses", []):
-                qty = wh.get("item_cnt", 0)
-                wh_name = wh.get("warehouse_name", "Склад")
-                if qty > 0:
-                    items.append([wh_name, offer_id, qty])
+        for r in resp.get("result", {}).get("rows", []):
+            sku = str(r.get("sku", ""))
+            oid = r.get("item_code") or sku
+            for wh in r.get("warehouses", []):
+                if wh.get("item_cnt", 0) > 0:
+                    items.append([wh.get("warehouse_name"), oid, wh.get("item_cnt")])
     return items
 
-# --- OZON SALES (v2 FBO) ---
 def fetch_sales(cid, key, d_from, d_to):
     items = []
     page = 1
     headers = get_headers(cid, key)
     url = "https://api-seller.ozon.ru/v2/posting/fbo/list"
-    
     while True:
         payload = {
             "filter": { "since": f"{d_from}T00:00:00Z", "to": f"{d_to}T23:59:59Z" },
-            "limit": 1000,
-            "page": page,
+            "limit": 1000, "page": page,
             "with": {"analytics_data": True, "financial_data": True}
         }
-        resp = post_req(url, headers, payload, "Sales")
+        resp = safe_post(url, headers, payload, "Sales")
         if not resp: break
-        
         res = resp.get("result", [])
         if not res: break
-        
         for p in res:
             created = p.get("created_at", "")[:10]
-            status = str(p.get("status", "")).lower()
-            typ = "Отмена" if "cancelled" in status else "Продажа"
-            
+            typ = "Отмена" if "cancelled" in str(p.get("status", "")).lower() else "Продажа"
             an = p.get("analytics_data") or {}
-            wh_from = an.get("warehouse_name", "FBO")
-            wh_to = an.get("region", "RU")
-            
             fin = p.get("financial_data") or {}
             fin_prods = {x.get('product_id'): x for x in fin.get('products', [])}
-            
             for prod in p.get("products", []):
                 sku = prod.get("sku")
-                oid = prod.get("offer_id")
-                fp = fin_prods.get(sku, {})
-                price = float(fp.get('client_price') or prod.get('price') or 0)
-                
-                items.append([created, typ, oid, str(sku), 1, price, wh_from, wh_to])
-        
+                price = float(fin_prods.get(sku, {}).get('client_price') or prod.get('price') or 0)
+                items.append([created, typ, prod.get("offer_id"), str(sku), 1, price, an.get("warehouse_name"), an.get("region")])
         if len(res) < 1000: break
         page += 1
         time.sleep(0.2)
-
     return items
 
 @app.route("/")
-def health(): return "Ozon v112 Clean OK", 200
+def health(): return "Ozon v113 Survival OK", 200
 
 @app.route("/sync", methods=['POST'])
 def sync():
     try:
         data = request.json
-        cid = data.get("clientId")
-        key = data.get("apiKey")
+        # Check mode
         mode = data.get("mode")
-        
         rows = []
         target = ""
         
         if mode == "CARDS":
-            rows = fetch_cards(cid, key)
+            rows = fetch_cards(data.get("clientId"), data.get("apiKey"))
             target = "OZ_CARDS_PY"
         elif mode == "STOCK":
-            rows = fetch_stocks(cid, key)
+            rows = fetch_stocks(data.get("clientId"), data.get("apiKey"))
             target = "OZ_STOCK_PY"
         elif mode == "SALES":
-            rows = fetch_sales(cid, key, data.get("dateFrom"), data.get("dateTo"))
+            rows = fetch_sales(data.get("clientId"), data.get("apiKey"), data.get("dateFrom"), data.get("dateTo"))
             target = "OZ_SALES_PY"
         elif mode == "FUNNEL":
-             return jsonify({"status": "empty"}), 200
-            
+            return jsonify({"status": "empty"}), 200
+
         if rows:
             send_data(target, rows)
             return jsonify({"status": "ok", "count": len(rows)}), 200
