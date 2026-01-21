@@ -1,175 +1,153 @@
-import os
-import time
 import requests
+import time
 import json
-from flask import Flask, request, jsonify
+import datetime
+import os
+import sys
 
-app = Flask(__name__)
-
-GAS_WEBAPP_URL = os.environ.get("GAS_WEBAPP_URL", "")
+# ================= ГЛАВНЫЕ НАСТРОЙКИ =================
+# Скрипт будет стучаться сюда за конфигом (кабинеты + даты)
+GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbwxQf0sos-ed3EABhyExUEidByp7Fkhn1oNud1m0SHE2M21BcndKhkqCFjv-nHRp_7M2g/exec" 
 SECRET_KEY = "MY_SUPER_SECRET_PASSWORD_123"
 
-# --- LOGGING ---
-def send_log(msg):
-    if not GAS_WEBAPP_URL: return
+# Как часто проверять обновления (в часах)
+UPDATE_INTERVAL_HOURS = 1 
+# =====================================================
+
+def log(msg):
+    ts = datetime.datetime.now().strftime('%H:%M:%S')
+    print(f"[{ts}] {msg}")
     try:
-        requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "LOG", "msg": str(msg)[:1000]}, timeout=3)
+        requests.post(GAS_WEBAPP_URL, json={"secret":SECRET_KEY, "type":"LOG", "msg": f"VPS: {str(msg)[:500]}"}, timeout=5)
     except: pass
 
-def send_data(sheet, rows):
-    if not GAS_WEBAPP_URL: return
+# --- МОЗГ: ЗАПРОС НАСТРОЕК ИЗ ТАБЛИЦЫ ---
+def get_config_from_gas():
+    log("Запрос настроек и периода из GAS...")
     try:
-        requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "DATA", "sheetName": sheet, "rows": rows}, timeout=45)
+        payload = {"secret": SECRET_KEY, "type": "GET_CONFIG"}
+        r = requests.post(GAS_WEBAPP_URL, json=payload, timeout=30)
+        data = r.json()
+        if data.get("status") == "ok":
+            return data # Возвращает {accounts: [...], period: {dateFrom:..., dateTo:...}}
+        else:
+            log(f"GAS вернул ошибку: {data}")
+            return None
+    except Exception as e:
+        log(f"Не удалось получить конфиг: {e}")
+        return None
+
+def clear_sheet(sheet_name):
+    try:
+        requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "CLEAR", "sheetName": sheet_name}, timeout=10)
     except: pass
 
-# --- HEADERS ---
+def send_to_gas(sheet_name, rows):
+    if not rows: return
+    log(f"Отправка {len(rows)} строк в {sheet_name}...")
+    try:
+        chunk_size = 3000
+        for i in range(0, len(rows), chunk_size):
+            chunk = rows[i:i + chunk_size]
+            payload = {"secret": SECRET_KEY, "type": "DATA", "sheetName": sheet_name, "rows": chunk}
+            requests.post(GAS_WEBAPP_URL, json=payload, timeout=90)
+            time.sleep(1)
+        log("Отправка завершена.")
+    except Exception as e:
+        log(f"Сбой отправки: {e}")
+
 def get_headers(cid, key):
     return {
-        "Client-Id": str(cid).strip().replace('"', '').replace("'", ""),
-        "Api-Key": str(key).strip().replace('"', '').replace("'", ""),
-        "Content-Type": "application/json",
-        "Accept": "application/json"
+        "Client-Id": str(cid).strip(), 
+        "Api-Key": str(key).strip(),
+        "Content-Type": "application/json", 
+        "User-Agent": "Mozilla/5.0 (compatible; OzonVPS/1.0)"
     }
 
-# --- OZON CARDS (Skeleton) ---
+# --- ФУНКЦИИ API OZON ---
 def fetch_cards(cid, key):
+    log("Загрузка карточек...")
     items = []
     headers = get_headers(cid, key)
-    
-    URL_LIST = "https://api-seller.ozon.ru/v2/product/list"
-    URL_INFO_LIST = "https://api-seller.ozon.ru/v2/product/info/list"
-    
-    last_id = "" 
-    details_blocked = False # Флаг блокировки деталей
-    
+    last_id = ""
     while True:
-        # 1. СПИСОК (List v2)
-        payload_list = { "filter": { "visibility": "ALL" }, "limit": 100 }
-        if last_id: payload_list["last_id"] = str(last_id)
-        
+        payload = {"filter": {"visibility": "ALL"}, "limit": 100}
+        if last_id: payload["last_id"] = str(last_id)
         try:
-            r = requests.post(URL_LIST, headers=headers, json=payload_list)
-            if r.status_code != 200:
-                send_log(f"List Fetch Error: {r.status_code}")
-                break
+            r = requests.post("https://api-seller.ozon.ru/v2/product/list", headers=headers, json=payload)
+            if r.status_code != 200: break
+            data = r.json().get("result", {}).get("items", [])
+            if not data: break
             
-            data_list = r.json().get("result", {}).get("items", [])
-            if not data_list: break
-        except Exception as e:
-            send_log(f"List Crash: {e}")
-            break
-
-        # 2. ПОПЫТКА ПОЛУЧИТЬ ДЕТАЛИ (Только если не заблокировано)
-        info_map = {}
-        ids = [int(i.get("product_id")) for i in data_list]
-        
-        if not details_blocked:
+            ids = [int(x.get("product_id")) for x in data]
+            info_map = {}
+            # Детали
             try:
-                # Пробуем получить детали
-                r_info = requests.post(URL_INFO_LIST, headers=headers, json={"product_id": ids})
-                
+                r_info = requests.post("https://api-seller.ozon.ru/v2/product/info/list", headers=headers, json={"product_id": ids})
                 if r_info.status_code == 200:
-                    for i in r_info.json().get("result", {}).get("items", []):
-                        info_map[i.get("id")] = i
-                elif r_info.status_code == 404:
-                    # Если 404 - блокируем попытки для всех следующих страниц
-                    details_blocked = True
-                    send_log("Details API returned 404. Switching to SKELETON mode (IDs only).")
-                else:
-                    send_log(f"Details Err: {r_info.status_code}")
-            except:
-                details_blocked = True
+                    for i in r_info.json().get("result", {}).get("items", []): info_map[i.get("id")] = i
+            except: pass
 
-        # 3. ЗАПОЛНЕНИЕ (Даже если details_blocked=True)
-        for basic in data_list:
-            pid = int(basic.get("product_id"))
-            
-            # Данные из Списка (всегда есть)
-            offer_id = basic.get("offer_id") or "Нет Артикула"
-            ozon_id = str(pid)
-            
-            # Данные из Деталей (могут отсутствовать)
-            details = info_map.get(pid, {})
-            
-            if details:
-                name = details.get("name") or "Товар"
-                cat = str(details.get("category_id", ""))
-                
-                primary = details.get("primary_image") or ""
-                if not primary and details.get("images"):
-                    imgs = details.get("images")
-                    primary = imgs[0] if isinstance(imgs[0], str) else imgs[0].get("file_name", "")
-                
-                # Бренд
+            for basic in data:
+                pid = int(basic.get("product_id"))
+                full = info_map.get(pid, {})
+                offer_id = full.get("offer_id") or basic.get("offer_id") or ""
+                ozon_id = str(pid)
+                name = full.get("name") or "Товар"
+                cat = str(full.get("category_id", ""))
+                primary = full.get("primary_image") or ""
+                if not primary and full.get("images"):
+                     imgs = full.get("images")
+                     primary = imgs[0] if isinstance(imgs[0], str) else imgs[0].get("file_name", "")
                 brand = ""
-                for a in details.get("attributes", []):
+                for a in full.get("attributes", []):
                     if a.get("attribute_id") in [85, 31]:
                         vals = a.get("values", [])
                         if vals: brand = vals[0].get("value", "")
                         break
-
-                def gp(k): return float(details.get(k) or details.get("price", {}).get(k) or 0)
-                p_old, p_sell, p_mkt = gp("old_price"), gp("price"), gp("marketing_price")
-                
-            else:
-                # ЗАГЛУШКИ (Скелет)
-                name = "Доступ ограничен (404)"
-                cat = "-"
-                primary = ""
-                brand = "OZON"
-                p_old, p_sell, p_mkt = 0, 0, 0
+                def gp(k): return float(full.get(k) or full.get("price", {}).get(k) or 0)
+                items.append([primary, ozon_id, offer_id, brand, cat, name, gp("old_price"), gp("price"), gp("marketing_price"), gp("marketing_price")])
             
-            if p_old == 0: p_old = p_sell
-            if p_mkt == 0: p_mkt = p_sell
-
-            # Структура колонок строго по ТЗ
-            items.append([
-                primary, ozon_id, offer_id, brand, cat, name, p_old, p_sell, p_mkt, p_mkt
-            ])
-
-        # Пагинация
-        last_item = data_list[-1]
-        last_id = str(last_item.get("product_id"))
-        
-        if len(data_list) < 100: break
-
+            last_item = data[-1]
+            last_id = str(last_item.get("product_id"))
+            if len(data) < 100: break
+        except: break
     return items
 
-# --- STOCK & SALES ---
 def fetch_stocks(cid, key):
+    log("Загрузка остатков...")
     items = []
     headers = get_headers(cid, key)
-    url = "https://api-seller.ozon.ru/v2/analytics/stock_on_warehouses"
     try:
-        r = requests.post(url, headers=headers, json={"limit": 1000, "offset": 0})
-        if r.status_code == 200:
-            for row in r.json().get("result", {}).get("rows", []):
-                sku = str(row.get("sku", ""))
-                oid = row.get("item_code") or sku
-                for wh in row.get("warehouses", []):
-                    if wh.get("item_cnt", 0) > 0:
-                        items.append([wh.get("warehouse_name"), oid, wh.get("item_cnt")])
-    except Exception as e: send_log(f"Stock Err: {e}")
+        r = requests.post("https://api-seller.ozon.ru/v2/analytics/stock_on_warehouses", headers=headers, json={"limit": 1000, "offset": 0})
+        rows = r.json().get("result", {}).get("rows", [])
+        for row in rows:
+            sku = str(row.get("sku", ""))
+            oid = row.get("item_code") or sku
+            for wh in row.get("warehouses", []):
+                if wh.get("item_cnt", 0) > 0:
+                    items.append([wh.get("warehouse_name"), oid, wh.get("item_cnt")])
+    except: pass
     return items
 
-def fetch_sales(cid, key, d_from, d_to):
+def fetch_sales(cid, key, date_from, date_to):
+    log(f"Загрузка продаж ({date_from} - {date_to})...")
     items = []
-    page = 1
     headers = get_headers(cid, key)
-    url = "https://api-seller.ozon.ru/v2/posting/fbo/list"
+    page = 1
+    # Приводим даты к формату Ozon
+    dt_from = f"{date_from}T00:00:00Z"
+    dt_to = f"{date_to}T23:59:59Z"
     
     while True:
         try:
-            payload = {
-                "filter": { "since": f"{d_from}T00:00:00Z", "to": f"{d_to}T23:59:59Z" },
-                "limit": 1000, "page": page,
+            r = requests.post("https://api-seller.ozon.ru/v2/posting/fbo/list", headers=headers, json={
+                "filter": { "since": dt_from, "to": dt_to }, "limit": 1000, "page": page,
                 "with": {"analytics_data": True, "financial_data": True}
-            }
-            r = requests.post(url, headers=headers, json=payload)
+            })
             if r.status_code != 200: break
             res = r.json().get("result", [])
             if not res: break
-            
             for p in res:
                 created = p.get("created_at", "")[:10]
                 typ = "Отмена" if "cancelled" in str(p.get("status", "")).lower() else "Продажа"
@@ -181,43 +159,60 @@ def fetch_sales(cid, key, d_from, d_to):
                     fp = fin_prods.get(sku, {})
                     price = float(fp.get('client_price') or prod.get('price') or 0)
                     items.append([created, typ, prod.get("offer_id"), str(sku), 1, price, an.get("warehouse_name"), an.get("region")])
-            
             if len(res) < 1000: break
             page += 1
-            time.sleep(0.2)
+            time.sleep(0.3)
         except: break
     return items
 
-@app.route("/")
-def health(): return "Ozon v115 Skeleton OK", 200
-
-@app.route("/sync", methods=['POST'])
-def sync():
-    try:
-        data = request.json
-        mode = data.get("mode")
-        rows = []
-        target = ""
-        
-        cid = data.get("clientId")
-        key = data.get("apiKey")
-        
-        if mode == "CARDS":
-            rows = fetch_cards(cid, key)
-            target = "OZ_CARDS_PY"
-        elif mode == "STOCK":
-            rows = fetch_stocks(cid, key)
-            target = "OZ_STOCK_PY"
-        elif mode == "SALES":
-            rows = fetch_sales(cid, key, data.get("dateFrom"), data.get("dateTo"))
-            target = "OZ_SALES_PY"
-        
-        # Всегда возвращаем JSON, даже если список пуст
-        if rows: send_data(target, rows)
-        return jsonify({"status": "ok", "count": len(rows)}), 200
-            
-    except Exception as e:
-        return jsonify({"error": str(e)}), 200 # Возвращаем 200 даже при ошибке, чтобы GAS не падал
-
+# --- ГЛАВНЫЙ ЦИКЛ РОБОТА ---
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    log("=== ЗАПУСК БОТА v119 (GAS CONFIG) ===")
+    
+    while True:
+        # 1. СПРАШИВАЕМ У ТАБЛИЦЫ, ЧТО ДЕЛАТЬ
+        config = get_config_from_gas()
+        
+        if not config:
+            log("Таблица не ответила или вернула ошибку. Жду 5 минут...")
+            time.sleep(300)
+            continue
+        
+        ACCOUNTS = config.get("accounts", [])
+        PERIOD = config.get("period", {})
+        
+        # Получаем даты из ответа таблицы
+        d_f = PERIOD.get("dateFrom", "2024-01-01")
+        d_t = PERIOD.get("dateTo", datetime.datetime.now().strftime("%Y-%m-%d"))
+
+        log(f"Получено задание: Кабинетов={len(ACCOUNTS)}, Период={d_f}-{d_t}")
+
+        # Очистка листов (можно отключить, если хотите копить историю)
+        clear_sheet("OZ_CARDS_PY")
+        clear_sheet("OZ_STOCK_PY")
+        clear_sheet("OZ_SALES_PY")
+        time.sleep(2)
+
+        for acc in ACCOUNTS:
+            name = acc.get('name', 'Без имени')
+            cid = acc.get('client_id')
+            key = acc.get('api_key')
+
+            try:
+                log(f"--> Обработка кабинета: {name}")
+                
+                cards = fetch_cards(cid, key)
+                if cards: send_to_gas("OZ_CARDS_PY", cards)
+                
+                stocks = fetch_stocks(cid, key)
+                if stocks: send_to_gas("OZ_STOCK_PY", stocks)
+                
+                # ВАЖНО: Передаем в функцию продаж даты из таблицы!
+                sales = fetch_sales(cid, key, d_f, d_t)
+                if sales: send_to_gas("OZ_SALES_PY", sales)
+                
+            except Exception as e:
+                log(f"Ошибка в кабинете {name}: {e}")
+        
+        log(f"Цикл завершен. Следующий запуск через {UPDATE_INTERVAL_HOURS} ч...")
+        time.sleep(UPDATE_INTERVAL_HOURS * 3600)
