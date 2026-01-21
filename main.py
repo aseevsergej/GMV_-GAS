@@ -14,7 +14,7 @@ def get_headers(cid, key):
         "Client-Id": str(cid).strip(), 
         "Api-Key": str(key).strip(),
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (compatible; Google-Apps-Script)"
     }
 
 def send_to_gas(payload):
@@ -23,29 +23,41 @@ def send_to_gas(payload):
     try: requests.post(GAS_WEBAPP_URL, json=payload, timeout=10)
     except: pass
 
-# --- OZON CARDS ---
+# --- OZON CARDS (Fixed Payload) ---
 def fetch_cards(cid, key):
     items = []
     
-    # Используем v2 product/list (самый надежный для связки с info)
+    # Строго v2 - он самый стабильный. v3 часто требует спец прав.
     url_list = "https://api-seller.ozon.ru/v2/product/list"
     url_info = "https://api-seller.ozon.ru/v2/product/info/list"
     last_id = ""
     
+    # Проверка доступа (Ping)
+    try:
+        # ВАЖНО: filter пустой объект обязателен
+        r = requests.post(url_list, headers=get_headers(cid, key), json={"filter": {}, "limit": 1})
+        if r.status_code != 200:
+            send_to_gas({"type": "LOG", "msg": f"OZ Auth Err: {r.status_code} {r.text[:50]}"})
+            return []
+    except Exception as e:
+        send_to_gas({"type": "LOG", "msg": f"OZ Conn Err: {str(e)}"})
+        return []
+
     while True:
         try:
-            payload = { "filter": { "visibility": "ALL" }, "limit": 200 }
+            payload = { 
+                "filter": { "visibility": "ALL" }, 
+                "limit": 500 
+            }
             if last_id: payload["last_id"] = last_id
             
             r = requests.post(url_list, headers=get_headers(cid, key), json=payload)
-            if r.status_code != 200: 
-                send_to_gas({"type": "LOG", "msg": f"OZ List Err: {r.status_code}"})
-                break
+            if r.status_code != 200: break
             
             data = r.json().get("result", {}).get("items", [])
             if not data: break
             
-            # Получаем детали
+            # Детали
             ids = [i.get("product_id") for i in data]
             r_info = requests.post(url_info, headers=get_headers(cid, key), json={"product_id": ids})
             
@@ -61,28 +73,25 @@ def fetch_cards(cid, key):
                 # Поля
                 offer_id = full.get("offer_id") or item_base.get("offer_id") or ""
                 ozon_id = str(pid)
-                name = full.get("name") or "Товар без названия"
+                name = full.get("name") or "Товар"
                 cat = str(full.get("category_id", ""))
                 
                 # Фото
                 primary = full.get("primary_image") or ""
                 if not primary and full.get("images"): primary = full["images"][0]
                 
-                # Бренд - пробуем достать из названия, если нет поля (Ozon часто не отдает brand в info)
-                brand = "OZON" 
+                # Бренд
+                brand = "OZON" # Заглушка, т.к. API v2 product/info редко отдает бренд в корне
                 
-                # Цены (парсинг всех возможных вариантов)
-                def get_price(obj, keys):
-                    for k in keys:
-                        val = obj.get(k)
-                        if val and float(val) > 0: return float(val)
-                    return 0.0
-
-                price_data = full.get("price") or {}
+                # Цены
+                def get_p(d, k): return float(d.get(k) or 0)
                 
-                p_old = get_price(full, ["old_price"]) or get_price(price_data, ["old_price", "price"])
-                p_sell = get_price(full, ["price"]) or get_price(price_data, ["price", "marketing_price"])
-                p_mkt = get_price(full, ["marketing_price"]) or get_price(price_data, ["marketing_price"])
+                # Ищем цену во всех возможных местах
+                price_obj = full.get("price") or {}
+                
+                p_old = get_p(full, "old_price") or get_p(price_obj, "old_price")
+                p_sell = get_p(full, "price") or get_p(price_obj, "price")
+                p_mkt = get_p(full, "marketing_price") or get_p(price_obj, "marketing_price")
                 
                 if p_mkt == 0: p_mkt = p_sell
                 if p_old == 0: p_old = p_sell
@@ -92,36 +101,34 @@ def fetch_cards(cid, key):
                     p_old, p_sell, p_mkt, p_mkt
                 ])
             
-            # Pagination
-            if len(data) > 0:
-                last_id = data[-1].get("product_id")
-            else:
-                break
-                
-            if len(data) < 200: break
+            last_id = data[-1].get("product_id")
+            if len(data) < 500: break
             
-        except Exception as e:
-            # send_to_gas({"type": "LOG", "msg": f"Cards Loop Err: {str(e)[:50]}"})
-            break
+        except: break
             
     return items
 
-# --- OZON STOCK ---
+# --- OZON STOCK (Fixed Logic) ---
 def fetch_stocks(cid, key):
     items = []
     try:
+        # limit: 1000, offset: 0 - стандарт
         r = requests.post("https://api-seller.ozon.ru/v2/analytics/stock_on_warehouses", headers=get_headers(cid, key), json={"limit": 1000, "offset":0})
         if r.status_code == 200:
             rows = r.json().get("result", {}).get("rows", [])
             for row in rows:
-                offer_id = row.get("item_code")
-                
-                for wh in row.get("warehouses", []):
-                    # Проверяем все типы остатков
-                    qty = wh.get("item_cnt", 0) 
+                sku = str(row.get("sku", ""))
+                offer_id = row.get("item_code") # Артикул селлера
+                if not offer_id: offer_id = sku
+
+                warehouses = row.get("warehouses", [])
+                for wh in warehouses:
                     name = wh.get("warehouse_name", "Склад")
+                    # item_cnt = Доступно к продаже (FBO)
+                    qty = wh.get("item_cnt", 0) 
                     
                     if qty > 0:
+                        # [Склад, Артикул, Остаток]
                         items.append([name, offer_id, qty])
     except: pass
     return items
@@ -158,12 +165,12 @@ def fetch_sales(cid, key, d_from, d_to):
                 wh_to = analytics.get("region", "RU")
                 
                 financial = p.get("financial_data") or {}
-                fin_prods = {x['product_id']: x for x in financial.get('products', [])}
+                fin_prods = {x.get('product_id'): x for x in financial.get('products', [])}
 
                 for prod in p.get("products", []):
                     sku = prod.get("sku")
-                    # Пытаемся найти реальную цену продажи (с учетом скидок)
                     fin = fin_prods.get(sku, {})
+                    # Цена продажи (фактическая, которую заплатил клиент)
                     price = float(fin.get('client_price') or prod.get('price') or 0)
                     
                     items.append([
@@ -173,12 +180,12 @@ def fetch_sales(cid, key, d_from, d_to):
             
             if len(res) < 1000: break
             page += 1
-            time.sleep(0.2)
+            time.sleep(0.3)
         except: break
     return items
 
 @app.route("/")
-def health(): return "Ozon v101 Ready", 200
+def health(): return "Ozon v102 Ready", 200
 
 @app.route("/sync", methods=['POST'])
 def sync():
@@ -188,8 +195,6 @@ def sync():
         key = data.get("apiKey")
         mode = data.get("mode")
         
-        if not cid or not key: return jsonify({"error": "Keys missing"}), 400
-
         rows = []
         target = ""
         
