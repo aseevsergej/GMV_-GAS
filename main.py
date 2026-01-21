@@ -13,7 +13,6 @@ SECRET_KEY = "MY_SUPER_SECRET_PASSWORD_123"
 def send_log(msg):
     if not GAS_WEBAPP_URL: return
     try:
-        # Обрезаем длинные сообщения
         requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "LOG", "msg": str(msg)[:2000]}, timeout=5)
     except: pass
 
@@ -23,136 +22,144 @@ def send_data(sheet, rows):
         requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "DATA", "sheetName": sheet, "rows": rows}, timeout=45)
     except: pass
 
-# --- ЗАГОЛОВКИ (STRIPPED) ---
+# --- ЗАГОЛОВКИ ---
 def get_headers(cid, key):
-    # Убираем все пробелы и невидимые символы
-    c_clean = str(cid).strip()
-    k_clean = str(key).strip()
     return {
-        "Client-Id": c_clean, 
-        "Api-Key": k_clean,
+        "Client-Id": str(cid).strip(), 
+        "Api-Key": str(key).strip(),
         "Content-Type": "application/json",
-        # Притворяемся браузером, чтобы избежать блокировок WAF
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (compatible; Google-Apps-Script)",
         "Accept": "application/json"
     }
 
 # --- ПОИСК БРЕНДА ---
-def get_brand(attrs):
-    for a in attrs:
-        # 85 - Brand, 31 - Model
-        if a.get("attribute_id") in [85, 31]: 
+def extract_brand(attributes):
+    # Ищем атрибут 85 (Бренд)
+    for a in attributes:
+        if a.get("attribute_id") == 85:
             vals = a.get("values", [])
             if vals: return vals[0].get("value", "")
     return ""
 
-# --- ПРОВЕРКА СВЯЗИ (PING) ---
-def check_connection(cid, key):
-    # Пробуем простой публичный метод, требующий авторизации
-    url = "https://api-seller.ozon.ru/v1/actions"
-    try:
-        r = requests.get(url, headers=get_headers(cid, key))
-        if r.status_code == 401:
-            send_log(f"DEBUG: Auth Error 401. Check ClientID/Key. CID starts with: {str(cid)[:2]}...")
-            return False
-        if r.status_code == 404:
-            # Если даже здесь 404 текстом - проблема в IP или маршруте
-            send_log(f"DEBUG: PING 404 (Strange). Body: {r.text[:50]}")
-            return False
-        return True
-    except Exception as e:
-        send_log(f"DEBUG: Connection Fail: {str(e)}")
-        return False
-
-# --- OZON CARDS (ТОВАРЫ) v3 ---
+# --- OZON CARDS (ТОВАРЫ) v3/v4 ---
 def fetch_cards(cid, key):
-    # 0. Диагностика
-    if not check_connection(cid, key):
-        send_log("ABORT: Connection check failed.")
-        return []
-
     items = []
-    # Переходим на v3 (более надежный endpoint)
+    headers = get_headers(cid, key)
+    
+    # 1. Получаем список ID (v3)
     url_list = "https://api-seller.ozon.ru/v3/product/list"
-    url_info = "https://api-seller.ozon.ru/v2/product/info/list"
+    # 2. Получаем Атрибуты (Имя, Бренд, Фото) (v3)
+    url_attr = "https://api-seller.ozon.ru/v3/products/info/attributes"
+    # 3. Получаем Цены (v4)
+    url_price = "https://api-seller.ozon.ru/v4/product/info/prices"
     
     last_id = ""
-    headers = get_headers(cid, key)
 
     while True:
         try:
-            # PAYLOAD для v3
-            payload = { 
+            # --- ШАГ 1: Список ID ---
+            payload_list = { 
                 "filter": { "visibility": "ALL" }, 
                 "limit": 100,
                 "last_id": last_id if last_id else ""
             }
-            
-            # ЗАПРОС СПИСКА
-            r = requests.post(url_list, headers=headers, json=payload)
-            
+            r = requests.post(url_list, headers=headers, json=payload_list)
             if r.status_code != 200:
-                # Если ошибка - логируем заголовки (без ключей) для проверки
-                send_log(f"OZ List ERR {r.status_code}. Msg: {r.text[:200]}")
+                send_log(f"OZ List ERR {r.status_code}: {r.text[:100]}")
                 break
             
-            # В v3 структура ответа немного другая (result -> items)
-            data = r.json().get("result", {}).get("items", [])
-            if not data: 
-                break # Конец списка
+            list_data = r.json().get("result", {}).get("items", [])
+            if not list_data: break
             
-            # ЗАПРОС ДЕТАЛЕЙ
-            ids = [i.get("product_id") for i in data]
-            r_info = requests.post(url_info, headers=headers, json={"product_id": ids})
+            # Собираем ID текущей пачки
+            ids = [i.get("product_id") for i in list_data]
             
-            info_map = {}
-            if r_info.status_code == 200:
-                for i in r_info.json().get("result", {}).get("items", []):
-                    info_map[i.get("id")] = i
-            else:
-                send_log(f"OZ Info ERR {r_info.status_code}")
+            # --- ШАГ 2: Атрибуты (Attributes) ---
+            attr_map = {}
+            try:
+                r_attr = requests.post(url_attr, headers=headers, json={
+                    "filter": {"product_id": ids, "visibility": "ALL"},
+                    "limit": 100
+                })
+                if r_attr.status_code == 200:
+                    for p in r_attr.json().get("result", []):
+                        attr_map[p.get("id")] = p
+                else:
+                    send_log(f"OZ Attr ERR {r_attr.status_code}")
+            except Exception as e:
+                send_log(f"OZ Attr Ex: {e}")
 
-            # СБОРКА
-            for item_base in data:
-                pid = item_base.get("product_id")
-                full = info_map.get(pid, {})
+            # --- ШАГ 3: Цены (Prices) ---
+            price_map = {}
+            try:
+                r_price = requests.post(url_price, headers=headers, json={
+                    "filter": {"product_id": ids, "visibility": "ALL"},
+                    "limit": 100
+                })
+                if r_price.status_code == 200:
+                    for p in r_price.json().get("result", {}).get("items", []):
+                        price_map[p.get("product_id")] = p
+                else:
+                    send_log(f"OZ Price ERR {r_price.status_code}")
+            except Exception as e:
+                send_log(f"OZ Price Ex: {e}")
+
+            # --- СБОРКА ИТОГОВОЙ СТРОКИ ---
+            for basic in list_data:
+                pid = basic.get("product_id")
                 
-                # Поля
+                # Данные из List
+                offer_id = basic.get("offer_id")
                 ozon_id = str(pid)
-                offer_id = full.get("offer_id") or item_base.get("offer_id") or "-"
-                name = full.get("name") or "Товар"
-                cat = str(full.get("category_id", ""))
-                brand = get_brand(full.get("attributes", []))
                 
-                # Фото
-                primary = full.get("primary_image") or ""
-                if not primary and full.get("images"): primary = full["images"][0]
-
-                # Цены
-                def gp(d, k): return float(d.get(k) or 0)
-                po = full.get("price", {})
+                # Данные из Attributes
+                att_data = attr_map.get(pid, {})
+                name = att_data.get("name") or "Товар"
+                cat_id = str(att_data.get("category_id", ""))
                 
-                p_old = gp(full, "old_price") or gp(po, "old_price")
-                p_sell = gp(full, "price") or gp(po, "price")
-                p_mkt = gp(full, "marketing_price") or gp(po, "marketing_price")
+                images = att_data.get("images", [])
+                primary = images[0].get("file_name", "") if images else ""
+                
+                brand = extract_brand(att_data.get("attributes", []))
+                
+                # Данные из Prices
+                pr_data = price_map.get(pid, {}).get("price", {})
+                
+                def f(v): return float(v) if v else 0.0
+                
+                p_old = f(pr_data.get("old_price"))
+                p_sell = f(pr_data.get("price"))
+                p_mkt = f(pr_data.get("marketing_price"))
                 
                 if p_old == 0: p_old = p_sell
                 if p_mkt == 0: p_mkt = p_sell
                 
+                # Структура для Google Sheet:
                 # [Фото, Арт.OZ, Арт.Наш, Бренд, Категория, Название, Ц.База, Ц.Прод, Ц.Покуп, Ц.Карта]
-                items.append([primary, ozon_id, offer_id, brand, cat, name, p_old, p_sell, p_mkt, p_mkt])
-            
-            last_id = data[-1].get("last_id") # В v3 пагинация через last_id из элемента
-            if not last_id: break 
-            if len(data) < 100: break
+                items.append([
+                    primary,
+                    ozon_id,
+                    offer_id,
+                    brand,
+                    cat_id,
+                    name,
+                    p_old,
+                    p_sell,
+                    p_mkt,
+                    p_mkt
+                ])
+
+            last_id = list_data[-1].get("last_id")
+            if not last_id: break
+            if len(list_data) < 100: break
             
         except Exception as e:
-            send_log(f"OZ Cards Exception: {str(e)}")
+            send_log(f"OZ Loop Ex: {str(e)}")
             break
             
     return items
 
-# --- OZON STOCK (Остатки) ---
+# --- OZON STOCK (Остатки v2) ---
 def fetch_stocks(cid, key):
     items = []
     url = "https://api-seller.ozon.ru/v2/analytics/stock_on_warehouses"
@@ -168,13 +175,11 @@ def fetch_stocks(cid, key):
                     wh_name = wh.get("warehouse_name", "Склад")
                     if qty > 0:
                         items.append([wh_name, offer_id, qty])
-        else:
-            send_log(f"OZ Stock ERR {r.status_code}: {r.text[:100]}")
     except Exception as e:
         send_log(f"OZ Stock Ex: {str(e)}")
     return items
 
-# --- OZON SALES (Продажи) ---
+# --- OZON SALES (Продажи FBO v2) ---
 def fetch_sales(cid, key, d_from, d_to):
     items = []
     page = 1
@@ -191,7 +196,7 @@ def fetch_sales(cid, key, d_from, d_to):
             }
             r = requests.post(url, headers=headers, json=payload)
             if r.status_code != 200:
-                send_log(f"OZ Sales ERR {r.status_code}: {r.text[:100]}")
+                send_log(f"OZ Sales ERR {r.status_code}")
                 break
             
             res = r.json().get("result", [])
@@ -226,7 +231,7 @@ def fetch_sales(cid, key, d_from, d_to):
     return items
 
 @app.route("/")
-def health(): return "Ozon v107 Debug OK", 200
+def health(): return "Ozon v108 Modern OK", 200
 
 @app.route("/sync", methods=['POST'])
 def sync():
@@ -236,9 +241,6 @@ def sync():
         key = data.get("apiKey")
         mode = data.get("mode")
         
-        # ЛОГИРУЕМ СТАРТ (для отладки)
-        # send_log(f"Start {mode}. CID: {str(cid)[:2]}***")
-
         rows = []
         target = ""
         
