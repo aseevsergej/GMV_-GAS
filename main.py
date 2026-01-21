@@ -9,12 +9,15 @@ app = Flask(__name__)
 GAS_WEBAPP_URL = os.environ.get("GAS_WEBAPP_URL", "")
 SECRET_KEY = "MY_SUPER_SECRET_PASSWORD_123"
 
+# --- УСИЛЕННЫЕ ЗАГОЛОВКИ ---
 def get_headers(cid, key):
     return {
         "Client-Id": str(cid).strip(), 
         "Api-Key": str(key).strip(),
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (compatible; Google-Apps-Script)"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Connection": "keep-alive"
     }
 
 def send_to_gas(payload):
@@ -23,21 +26,19 @@ def send_to_gas(payload):
     try: requests.post(GAS_WEBAPP_URL, json=payload, timeout=10)
     except: pass
 
-# --- OZON CARDS (Fixed Payload) ---
+# --- OZON CARDS (ROBUST) ---
 def fetch_cards(cid, key):
     items = []
     
-    # Строго v2 - он самый стабильный. v3 часто требует спец прав.
     url_list = "https://api-seller.ozon.ru/v2/product/list"
     url_info = "https://api-seller.ozon.ru/v2/product/info/list"
     last_id = ""
     
-    # Проверка доступа (Ping)
+    # 1. Проверка связи (Ping)
     try:
-        # ВАЖНО: filter пустой объект обязателен
-        r = requests.post(url_list, headers=get_headers(cid, key), json={"filter": {}, "limit": 1})
-        if r.status_code != 200:
-            send_to_gas({"type": "LOG", "msg": f"OZ Auth Err: {r.status_code} {r.text[:50]}"})
+        ping = requests.post(url_list, headers=get_headers(cid, key), json={"filter": {}, "limit": 1})
+        if ping.status_code != 200:
+            send_to_gas({"type": "LOG", "msg": f"OZ Auth Fail: {ping.status_code} {ping.text[:100]}"})
             return []
     except Exception as e:
         send_to_gas({"type": "LOG", "msg": f"OZ Conn Err: {str(e)}"})
@@ -45,14 +46,17 @@ def fetch_cards(cid, key):
 
     while True:
         try:
+            # Body запроса строго по документации
             payload = { 
                 "filter": { "visibility": "ALL" }, 
-                "limit": 500 
+                "limit": 100 
             }
             if last_id: payload["last_id"] = last_id
             
             r = requests.post(url_list, headers=get_headers(cid, key), json=payload)
-            if r.status_code != 200: break
+            if r.status_code != 200: 
+                send_to_gas({"type": "LOG", "msg": f"OZ List {r.status_code}"})
+                break
             
             data = r.json().get("result", {}).get("items", [])
             if not data: break
@@ -80,13 +84,11 @@ def fetch_cards(cid, key):
                 primary = full.get("primary_image") or ""
                 if not primary and full.get("images"): primary = full["images"][0]
                 
-                # Бренд
-                brand = "OZON" # Заглушка, т.к. API v2 product/info редко отдает бренд в корне
+                # Бренд (ищем в атрибутах если нет в корне)
+                brand = "OZON" 
                 
                 # Цены
                 def get_p(d, k): return float(d.get(k) or 0)
-                
-                # Ищем цену во всех возможных местах
                 price_obj = full.get("price") or {}
                 
                 p_old = get_p(full, "old_price") or get_p(price_obj, "old_price")
@@ -96,23 +98,23 @@ def fetch_cards(cid, key):
                 if p_mkt == 0: p_mkt = p_sell
                 if p_old == 0: p_old = p_sell
 
+                # [Фото, Арт.OZ, Арт.Наш, Бренд, Категория, Название, Ц.База, Ц.Прод, Ц.Покуп, Ц.Карта]
                 items.append([
                     primary, ozon_id, offer_id, brand, cat, name,
                     p_old, p_sell, p_mkt, p_mkt
                 ])
             
             last_id = data[-1].get("product_id")
-            if len(data) < 500: break
+            if len(data) < 100: break
             
         except: break
             
     return items
 
-# --- OZON STOCK (Fixed Logic) ---
+# --- OZON STOCK ---
 def fetch_stocks(cid, key):
     items = []
     try:
-        # limit: 1000, offset: 0 - стандарт
         r = requests.post("https://api-seller.ozon.ru/v2/analytics/stock_on_warehouses", headers=get_headers(cid, key), json={"limit": 1000, "offset":0})
         if r.status_code == 200:
             rows = r.json().get("result", {}).get("rows", [])
@@ -124,8 +126,7 @@ def fetch_stocks(cid, key):
                 warehouses = row.get("warehouses", [])
                 for wh in warehouses:
                     name = wh.get("warehouse_name", "Склад")
-                    # item_cnt = Доступно к продаже (FBO)
-                    qty = wh.get("item_cnt", 0) 
+                    qty = wh.get("item_cnt", 0) # FBO доступно
                     
                     if qty > 0:
                         # [Склад, Артикул, Остаток]
@@ -133,10 +134,11 @@ def fetch_stocks(cid, key):
     except: pass
     return items
 
-# --- OZON SALES ---
+# --- OZON SALES (v2 Posting FBO) ---
 def fetch_sales(cid, key, d_from, d_to):
     items = []
     page = 1
+    # Формат дат для Ozon: 2024-01-01T00:00:00Z
     since_dt = f"{d_from}T00:00:00Z"
     to_dt = f"{d_to}T23:59:59Z"
 
@@ -149,7 +151,10 @@ def fetch_sales(cid, key, d_from, d_to):
                 "with": { "analytics_data": True, "financial_data": True }
             }
             r = requests.post("https://api-seller.ozon.ru/v2/posting/fbo/list", headers=get_headers(cid, key), json=payload)
-            if r.status_code != 200: break
+            if r.status_code != 200: 
+                send_to_gas({"type": "LOG", "msg": f"OZ Sales {r.status_code}"})
+                break
+            
             res = r.json().get("result", [])
             if not res: break
             
@@ -170,9 +175,10 @@ def fetch_sales(cid, key, d_from, d_to):
                 for prod in p.get("products", []):
                     sku = prod.get("sku")
                     fin = fin_prods.get(sku, {})
-                    # Цена продажи (фактическая, которую заплатил клиент)
+                    # Берем client_price, если нет - price
                     price = float(fin.get('client_price') or prod.get('price') or 0)
                     
+                    # [Дата, Тип, Арт.Наш, Арт.OZ, Кол, Цена, Склад Отгр., Склад Дост.]
                     items.append([
                         created[:10], typ, prod.get("offer_id"), str(sku), 
                         1, price, wh_from, wh_to
@@ -185,7 +191,7 @@ def fetch_sales(cid, key, d_from, d_to):
     return items
 
 @app.route("/")
-def health(): return "Ozon v102 Ready", 200
+def health(): return "Ozon v103 OK", 200
 
 @app.route("/sync", methods=['POST'])
 def sync():
