@@ -51,14 +51,18 @@ def send_to_gas(sheet_name, rows):
             chunk = rows[i:i + chunk_size]
             payload = {"secret": SECRET_KEY, "type": "DATA", "sheetName": sheet_name, "rows": chunk, "server_info": get_server_load()}
             requests.post(GAS_WEBAPP_URL, json=payload, timeout=90)
-            time.sleep(1)
+            time.sleep(1.2)
         log("Отправка завершена.")
     except Exception as e: log(f"Err Send: {e}", "ERR")
 
+# === ВАЖНО: Добавили User-Agent ===
 def get_headers(cid, key):
-    return {"Client-Id": str(cid).strip(), "Api-Key": str(key).strip(), "Content-Type": "application/json"}
-
-# === НОВЫЕ МЕТОДЫ ЗАГРУЗКИ (v129) ===
+    return {
+        "Client-Id": str(cid).strip(), 
+        "Api-Key": str(key).strip(), 
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; OzonMfactorBot/1.0)"
+    }
 
 def fetch_cards(cid, key, acc_name):
     log("Загрузка товаров (v2/product/list)...")
@@ -66,7 +70,6 @@ def fetch_cards(cid, key, acc_name):
     headers = get_headers(cid, key)
     last_id = ""
     
-    # URL строго прописан
     URL_LIST = "https://api-seller.ozon.ru/v2/product/list"
     URL_INFO = "https://api-seller.ozon.ru/v2/product/info/list"
 
@@ -77,13 +80,12 @@ def fetch_cards(cid, key, acc_name):
         try:
             r = requests.post(URL_LIST, headers=headers, json=payload)
             if r.status_code != 200:
-                log(f"Ошибка API Карточек {r.status_code}: {r.text[:100]}", "ERR")
+                log(f"Товары 404/Err? Код: {r.status_code}. Тело: {r.text[:50]}", "ERR")
                 break
                 
             data = r.json().get("result", {}).get("items", [])
             if not data: break
             
-            # Детали
             ids = [int(x.get("product_id")) for x in data]
             info_map = {}
             try:
@@ -95,37 +97,27 @@ def fetch_cards(cid, key, acc_name):
                 try:
                     pid = int(basic.get("product_id"))
                     full = info_map.get(pid, {})
-                    
                     offer_id = str(full.get("offer_id") or basic.get("offer_id") or "NO_ID")
                     ozon_id = str(pid)
                     name = str(full.get("name") or "Товар")
                     cat = str(full.get("category_id", ""))
-                    
                     primary = ""
                     if full.get("primary_image"): primary = full.get("primary_image")
-                    elif full.get("images") and len(full.get("images")) > 0: primary = full.get("images")[0]
+                    elif full.get("images"): primary = full.get("images")[0]
                     if isinstance(primary, dict): primary = primary.get("file_name", "")
-
-                    brand = "No Brand"
-                    for a in full.get("attributes", []):
-                        if a.get("attribute_id") in [85, 31]:
-                            if a.get("values"): brand = a.get("values")[0].get("value", "")
-                            break
                     
+                    # Цены
                     old_p = float(full.get("old_price") or 0)
                     mkt_p = float(full.get("marketing_price") or 0)
                     buy_p = float(full.get("price") or 0)
 
-                    items.append([acc_name, primary, ozon_id, offer_id, brand, cat, name, old_p, mkt_p, buy_p, buy_p])
+                    items.append([acc_name, primary, ozon_id, offer_id, "No Brand", cat, name, old_p, mkt_p, buy_p, buy_p])
                 except: continue
 
             last_item = data[-1]
             last_id = str(last_item.get("product_id"))
             if len(data) < 100: break
-            
-        except Exception as e:
-            log(f"Сбой цикла товаров: {e}", "ERR")
-            break
+        except: break
             
     log(f"Найдено товаров: {len(items)}")
     return items
@@ -135,18 +127,17 @@ def fetch_stocks(cid, key, acc_name):
     items = []
     headers = get_headers(cid, key)
     last_id = ""
-    
-    # НОВЫЙ URL (FBO)
     URL_STOCK = "https://api-seller.ozon.ru/v3/product/info/stocks"
     
     while True:
-        payload = {"filter": {"visibility": "ALL"}, "limit": 100}
+        # ИСПРАВЛЕНО: для v3 filter должен быть пустым, а не visibility:ALL
+        payload = {"filter": {}, "limit": 100}
         if last_id: payload["last_id"] = str(last_id)
 
         try:
             r = requests.post(URL_STOCK, headers=headers, json=payload)
             if r.status_code != 200:
-                log(f"Ошибка API Остатков {r.status_code}: {r.text[:100]}", "ERR")
+                log(f"Остатки Err {r.status_code}: {r.text[:50]}", "ERR")
                 break
                 
             res = r.json().get("result", {})
@@ -156,23 +147,16 @@ def fetch_stocks(cid, key, acc_name):
             for prod in data:
                 try:
                     offer_id = prod.get("offer_id", "")
-                    # Перебираем склады (stocks)
                     for stock in prod.get("stocks", []):
-                        # type: "fbo" - склады озон, "fbs" - свои
                         st_type = stock.get("type", "")
                         cnt = stock.get("present", 0)
                         if cnt > 0:
-                            # Имя склада часто не отдается в v3, пишем тип
-                            wh_name = f"Ozon {st_type.upper()}"
-                            items.append([acc_name, wh_name, offer_id, cnt])
+                            items.append([acc_name, f"Ozon {st_type.upper()}", offer_id, cnt])
                 except: continue
             
             last_id = res.get("last_id", "")
             if not last_id or len(data) < 100: break
-            
-        except Exception as e:
-            log(f"Сбой остатков: {e}", "ERR")
-            break
+        except: break
             
     log(f"Найдено остатков: {len(items)}")
     return items
@@ -193,21 +177,23 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
             if r.status_code != 200: break
             res = r.json().get("result", [])
             if not res: break
-            
             for p in res:
-                created = p.get("created_at", "")[:10]
-                status = str(p.get("status", "")).lower()
-                typ = "Отмена" if "cancelled" in status else "Продажа"
-                fin = p.get("financial_data") or {}
-                an = p.get("analytics_data") or {}
-                fin_prods = {x.get('product_id'): x for x in fin.get('products', [])}
-                
-                for prod in p.get("products", []):
-                    sku = prod.get("sku")
-                    fp = fin_prods.get(sku, {})
-                    price = float(fp.get('client_price') or prod.get('price') or 0)
-                    items.append([acc_name, created, typ, prod.get("offer_id"), str(sku), 1, price, an.get("warehouse_name",""), an.get("region","")])
-            
+                try:
+                    created = p.get("created_at", "")[:10]
+                    status = str(p.get("status", "")).lower()
+                    typ = "Отмена" if "cancelled" in status else "Продажа"
+                    fin = p.get("financial_data") or {}
+                    an = p.get("analytics_data") or {}
+                    fin_prods = {x.get('product_id'): x for x in fin.get('products', [])}
+                    wh_from = an.get("warehouse_name") or "Неизвестно"
+                    wh_to = an.get("region") or "Неизвестно"
+                    
+                    for prod in p.get("products", []):
+                        sku = prod.get("sku")
+                        fp = fin_prods.get(sku, {})
+                        price = float(fp.get('client_price') or prod.get('price') or 0)
+                        items.append([acc_name, created, typ, prod.get("offer_id"), str(sku), 1, price, wh_from, wh_to])
+                except: continue
             if len(res) < 1000: break
             page += 1
             time.sleep(0.2)
@@ -216,7 +202,7 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
     return items
 
 if __name__ == "__main__":
-    log("=== ЗАПУСК v129 (NEW API) ===")
+    log("=== ЗАПУСК v130 (HEADERS FIX) ===")
     if GAS_WEBAPP_URL:
         try: requests.post(GAS_WEBAPP_URL, json={"secret":SECRET_KEY, "type":"INIT_VPS"}, timeout=10)
         except: pass
@@ -224,10 +210,12 @@ if __name__ == "__main__":
     while True:
         config = get_config_from_gas()
         
-        # Умный дефолт дат (7 дней), если конфига нет
+        # Умный дефолт
         now = datetime.datetime.now()
         d_f = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
         d_t = now.strftime("%Y-%m-%d")
+        source_msg = "АВАРИЙНЫЙ (Нет связи)"
+        
         ACCOUNTS = []
         SETTINGS = {"oz_cards":True, "oz_stock":True, "oz_sales":True}
 
@@ -236,13 +224,15 @@ if __name__ == "__main__":
             p = config.get("period", {})
             if p and p.get("dateFrom"):
                 d_f, d_t = p.get("dateFrom"), p.get("dateTo")
+                source_msg = "ТАБЛИЦА"
             SETTINGS = config.get("settings") or SETTINGS
         else:
             log("Жду конфиг...", "WARN")
             time.sleep(60)
             continue
 
-        log(f"Период: {d_f} - {d_t}")
+        log(f"Период: {d_f} - {d_t} | Источник: {source_msg}")
+        
         try: requests.post(GAS_WEBAPP_URL, json={"secret":SECRET_KEY, "type":"CLEAR_BUFFERS"}, timeout=10)
         except: pass
         time.sleep(1)
