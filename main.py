@@ -4,19 +4,9 @@ import json
 import datetime
 import os
 import sys
-import ssl
-from requests.adapters import HTTPAdapter
-from urllib3.poolmanager import PoolManager
 from dotenv import load_dotenv
 
-# --- МАГИЯ 1: МАСКИРОВКА ПОД БРАУЗЕР (SSL/TLS) ---
-class CipherAdapter(HTTPAdapter):
-    def init_poolmanager(self, connections, maxsize, block=False):
-        context = ssl.create_default_context()
-        # Этот набор шифров делает Python похожим на Chrome для защиты Ozon
-        context.set_ciphers('ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384')
-        self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, ssl_context=context)
-
+# Отключаем сложные SSL адаптеры, пробуем просто через Прокси (так надежнее для v1)
 try:
     import psutil
     PSUTIL_OK = True
@@ -30,16 +20,9 @@ SECRET_KEY = os.getenv("SECRET_KEY", "MY_SUPER_SECRET_PASSWORD_123")
 UPDATE_INTERVAL_HOURS = int(os.getenv("UPDATE_INTERVAL_HOURS", 1))
 PROXY_URL = os.getenv("PROXY_URL")
 
-# --- МАГИЯ 2: СБОРКА СЕССИИ (PROXY + SSL) ---
 session = requests.Session()
-
-# 1. Включаем маскировку SSL
-session.mount('https://', CipherAdapter())
-
-# 2. Включаем Прокси
 if PROXY_URL:
     session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
-    print(f"--> SYSTEM: Proxy Configured")
 
 def get_server_load():
     if not PSUTIL_OK: return {"cpu": 0, "ram": 0}
@@ -51,17 +34,14 @@ def log(msg, type="LOG_VPS"):
     print(f"[{ts}] {msg}")
     if GAS_WEBAPP_URL:
         try:
-            # Логи отправляем через обычный requests (без прокси), чтобы быстрее
             requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": type, "msg": f"{msg}", "server_info": get_server_load()}, timeout=5)
         except: pass
 
 def check_ip():
     try:
         r = session.get("https://api.ipify.org?format=json", timeout=15)
-        ip = r.json().get("ip")
-        log(f"--> SYSTEM: Реальный IP запроса: {ip}")
-    except:
-        log("--> SYSTEM: Не удалось проверить IP (но работаем дальше)")
+        log(f"--> SYSTEM: Работаем через IP: {r.json().get('ip')}")
+    except: log("--> SYSTEM: Не удалось определить IP")
 
 def get_config_from_gas():
     log("Запрос конфига...")
@@ -90,38 +70,68 @@ def update_headers(cid, key):
         "Client-Id": str(cid).strip(),
         "Api-Key": str(key).strip(),
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Origin": "https://seller.ozon.ru",
-        "Referer": "https://seller.ozon.ru/"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     })
 
+# === ГЛАВНАЯ ФУНКЦИЯ ПОИСКА ТОВАРОВ ===
 def fetch_cards(cid, key, acc_name):
     update_headers(cid, key)
-    URL = "https://api-seller.ozon.ru/v2/product/list"
-    URL_INFO = "https://api-seller.ozon.ru/v2/product/info/list"
-    items = []
-    last_id = ""
-    
     masked_key = str(key)[:5] + "..."
-    log(f"Товары (Key: {masked_key})...")
+    log(f"Ищем товары для {acc_name} (ID: {cid}, Key: {masked_key})...")
     
+    items = []
+    
+    # СТРАТЕГИЯ 1: v2 standard
+    url = "https://api-seller.ozon.ru/v2/product/list"
+    payload = {"filter": {"visibility": "ALL"}, "limit": 100}
+    
+    r = None
+    try:
+        r = session.post(url, json=payload)
+    except Exception as e: log(f"Err connection: {e}", "ERR")
+
+    # Если v2 не сработал (404/403) - пробуем СТРАТЕГИЮ 2
+    if r is None or r.status_code != 200:
+        if r: log(f"v2 (ALL) не прошел ({r.status_code}). Пробуем v2 (Empty)...")
+        
+        # СТРАТЕГИЯ 2: v2 без фильтра
+        payload = {"filter": {}, "limit": 100}
+        try:
+            r = session.post(url, json=payload)
+        except: pass
+        
+        # Если и это не сработало - СТРАТЕГИЯ 3: Старый добрый v1
+        if r is None or r.status_code != 200:
+            if r: log(f"v2 (Empty) не прошел ({r.status_code}). Пробуем v1 (Legacy)...")
+            url = "https://api-seller.ozon.ru/v1/product/list"
+            payload = {"filter": {}, "limit": 100} 
+            try:
+                r = session.post(url, json=payload)
+            except: pass
+            
+            if r is None or r.status_code != 200:
+                log(f"ВСЕ МЕТОДЫ ПРОВАЛЕНЫ. Проверьте Client-ID! Ответ: {r.text[:100] if r else 'None'}", "ERR")
+                return []
+    
+    # Если мы тут - значит какой-то url сработал
+    log(f"УСПЕХ! Сработал метод: {url}")
+    
+    # Качаем данные (универсальный цикл)
+    last_id = ""
     while True:
-        payload = {"filter": {"visibility": "ALL"}, "limit": 100}
         if last_id: payload["last_id"] = str(last_id)
         try:
-            r = session.post(URL, json=payload)
-            if r.status_code != 200:
-                log(f"Err {r.status_code}. Ответ Ozon: {r.text[:50]}", "ERR")
-                break
+            r = session.post(url, json=payload)
             data = r.json().get("result", {}).get("items", [])
             if not data: break
             
             ids = [int(x.get("product_id")) for x in data]
+            info_map = {}
             try:
-                r_info = session.post(URL_INFO, json={"product_id": ids})
+                # Детали всегда берем через v2/info - он работает стабильно
+                r_info = session.post("https://api-seller.ozon.ru/v2/product/info/list", json={"product_id": ids})
                 info_map = {i.get("id"): i for i in r_info.json().get("result", {}).get("items", [])}
-            except: info_map = {}
+            except: pass
 
             for basic in data:
                 try:
@@ -131,6 +141,7 @@ def fetch_cards(cid, key, acc_name):
                     ozon_id = str(pid)
                     name = str(full.get("name") or "Товар")
                     cat = str(full.get("category_id", ""))
+                    
                     primary = ""
                     if full.get("primary_image"): primary = full.get("primary_image")
                     elif full.get("images"): primary = full.get("images")[0]
@@ -145,36 +156,36 @@ def fetch_cards(cid, key, acc_name):
             last_item = data[-1]
             last_id = str(last_item.get("product_id"))
             if len(data) < 100: break
-        except Exception as e:
-            log(f"Exception: {e}", "ERR")
-            break
+        except: break
+            
     log(f"Найдено товаров: {len(items)}")
     return items
 
 def fetch_stocks(cid, key, acc_name):
     update_headers(cid, key)
-    log(f"Остатки (v3)...")
+    # Тоже пробуем v3, если нет - v2
+    url = "https://api-seller.ozon.ru/v3/product/info/stocks"
+    payload = {"filter": {}, "limit": 100}
+    
+    try:
+        r = session.post(url, json=payload)
+        if r.status_code != 200:
+            url = "https://api-seller.ozon.ru/v2/product/info/stocks"
+            r = session.post(url, json=payload)
+            if r.status_code != 200: return []
+    except: return []
+
     items = []
-    last_id = ""
-    while True:
-        payload = {"filter": {}, "limit": 100}
-        if last_id: payload["last_id"] = str(last_id)
-        try:
-            r = session.post("https://api-seller.ozon.ru/v3/product/info/stocks", json=payload)
-            if r.status_code != 200: break
-            res = r.json().get("result", {})
-            data = res.get("items", [])
-            if not data: break
-            for prod in data:
-                try:
-                    offer_id = prod.get("offer_id", "")
-                    for stock in prod.get("stocks", []):
-                        if stock.get("present", 0) > 0:
-                            items.append([acc_name, f"Ozon {stock.get('type')}", offer_id, stock.get("present")])
-                except: continue
-            last_id = res.get("last_id", "")
-            if not last_id or len(data) < 100: break
-        except: break
+    try:
+        res = r.json().get("result", {})
+        data = res.get("items", [])
+        for prod in data:
+            offer_id = prod.get("offer_id", "")
+            for stock in prod.get("stocks", []):
+                if stock.get("present", 0) > 0:
+                    items.append([acc_name, f"Ozon {stock.get('type')}", offer_id, stock.get("present")])
+    except: pass
+    
     log(f"Найдено остатков: {len(items)}")
     return items
 
@@ -207,7 +218,7 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
     return items
 
 if __name__ == "__main__":
-    log("=== ЗАПУСК v142 (COMBO: PROXY + SSL) ===")
+    log("=== ЗАПУСК v143 (OMNIVORE: v1/v2/Filters) ===")
     check_ip()
 
     while True:
@@ -233,7 +244,6 @@ if __name__ == "__main__":
         for acc in ACCOUNTS:
             name, cid, key = acc.get('name'), acc.get('client_id'), acc.get('api_key')
             try:
-                log(f"--> {name}")
                 if SETTINGS.get("oz_cards", True):
                     data = fetch_cards(cid, key, name)
                     if data: send_to_gas("OZ_CARDS_PY", data)
