@@ -101,44 +101,52 @@ def fetch_cards(cid, key, acc_name):
             info_map = {}
             try:
                 r_info = requests.post("https://api-seller.ozon.ru/v2/product/info/list", headers=headers, json={"product_id": ids})
-                if r_info.status_code == 200:
-                    for i in r_info.json().get("result", {}).get("items", []): info_map[i.get("id")] = i
+                for i in r_info.json().get("result", {}).get("items", []): info_map[i.get("id")] = i
             except: pass
 
             for basic in data:
+                # МЯГКИЙ РЕЖИМ: Если данных нет, ставим заглушки, но не пропускаем товар
+                pid = int(basic.get("product_id"))
+                full = info_map.get(pid, {})
+                
+                offer_id = str(full.get("offer_id") or basic.get("offer_id") or "NO_ART")
+                ozon_id = str(pid)
+                name = str(full.get("name") or "Товар без названия")
+                cat = str(full.get("category_id", ""))
+                
+                primary = ""
                 try:
-                    pid = int(basic.get("product_id"))
-                    full = info_map.get(pid, {})
-                    
-                    offer_id = str(full.get("offer_id") or basic.get("offer_id") or "")
-                    ozon_id = str(pid)
-                    name = str(full.get("name") or "Товар")
-                    cat = str(full.get("category_id", ""))
-                    
                     primary = full.get("primary_image") or ""
                     if not primary and full.get("images"):
                         imgs = full.get("images")
                         primary = imgs[0] if isinstance(imgs[0], str) else imgs[0].get("file_name", "")
+                except: primary = ""
 
-                    brand = ""
+                brand = "No Brand"
+                try:
                     for a in full.get("attributes", []):
                         if a.get("attribute_id") in [85, 31]:
                             vals = a.get("values", [])
                             if vals: brand = vals[0].get("value", "")
                             break
-                    
-                    old_p = float(full.get("old_price") or 0)
-                    mkt_p = float(full.get("marketing_price") or 0)
-                    buy_p = float(full.get("price") or 0)
-                    card_p = buy_p 
+                except: pass
+                
+                # Цены (если нет - 0)
+                old_p = float(full.get("old_price") or 0)
+                mkt_p = float(full.get("marketing_price") or 0)
+                buy_p = float(full.get("price") or 0)
+                
+                # ДОБАВЛЯЕМ В ЛЮБОМ СЛУЧАЕ
+                items.append([acc_name, primary, ozon_id, offer_id, brand, cat, name, old_p, mkt_p, buy_p, buy_p])
 
-                    # Важный момент: добавляем acc_name ПЕРВОЙ колонкой
-                    items.append([acc_name, primary, ozon_id, offer_id, brand, cat, name, old_p, mkt_p, buy_p, card_p])
-                except: continue
-
-            last_id = str(data[-1].get("product_id"))
+            last_item = data[-1]
+            last_id = str(last_item.get("product_id"))
             if len(data) < 100: break
-        except: break
+        except Exception as e:
+            log(f"Ошибка в списке товаров: {e}", "ERR")
+            break
+            
+    log(f"Найдено товаров: {len(items)}") # Пишем в лог сколько нашли
     return items
 
 def fetch_stocks(cid, key, acc_name):
@@ -147,16 +155,22 @@ def fetch_stocks(cid, key, acc_name):
     headers = get_headers(cid, key)
     try:
         r = requests.post("https://api-seller.ozon.ru/v2/analytics/stock_on_warehouses", headers=headers, json={"limit": 1000, "offset": 0})
-        rows = r.json().get("result", {}).get("rows", [])
+        # ЛОГИРУЕМ ОТВЕТ (кратко), чтобы понять, дает ли Озон остатки
+        res_json = r.json()
+        rows = res_json.get("result", {}).get("rows", [])
+        if not rows:
+             log(f"API Остатков вернуло 0 строк. Ответ: {str(res_json)[:100]}")
+        
         for row in rows:
-            try:
-                sku = str(row.get("sku", ""))
-                oid = str(row.get("item_code") or sku)
-                for wh in row.get("warehouses", []):
-                    if wh.get("item_cnt", 0) > 0:
-                        items.append([acc_name, wh.get("warehouse_name"), oid, wh.get("item_cnt")])
-            except: continue
-    except: pass
+            sku = str(row.get("sku", ""))
+            oid = str(row.get("item_code") or sku)
+            for wh in row.get("warehouses", []):
+                cnt = wh.get("item_cnt", 0)
+                if cnt > 0:
+                    items.append([acc_name, wh.get("warehouse_name"), oid, cnt])
+    except Exception as e: log(f"Ошибка API Stocks: {e}", "ERR")
+    
+    log(f"Найдено остатков: {len(items)}")
     return items
 
 def fetch_sales(cid, key, date_from, date_to, acc_name):
