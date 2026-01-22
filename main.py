@@ -4,24 +4,29 @@ import json
 import datetime
 import os
 import sys
+import psutil
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# НАСТРОЙКИ
 GAS_WEBAPP_URL = os.getenv("GAS_WEBAPP_URL")
 SECRET_KEY = os.getenv("SECRET_KEY", "MY_SUPER_SECRET_PASSWORD_123")
 UPDATE_INTERVAL_HOURS = int(os.getenv("UPDATE_INTERVAL_HOURS", 1))
 
-if not GAS_WEBAPP_URL:
-    print("CRITICAL: Не задан GAS_WEBAPP_URL в .env")
-
-def log(msg):
+def log(msg, type="LOG"):
     ts = datetime.datetime.now().strftime('%H:%M:%S')
     print(f"[{ts}] {msg}")
     if GAS_WEBAPP_URL:
         try:
-            requests.post(GAS_WEBAPP_URL, json={"secret":SECRET_KEY, "type":"LOG", "msg": f"VPS: {str(msg)[:500]}"}, timeout=5)
+            # Добавляем инфо о нагрузке сервера в каждый лог
+            cpu = psutil.cpu_percent()
+            ram = psutil.virtual_memory().percent
+            requests.post(GAS_WEBAPP_URL, json={
+                "secret":SECRET_KEY, 
+                "type": type, 
+                "msg": f"VPS: {str(msg)[:500]}",
+                "server_load": {"cpu": cpu, "ram": ram}
+            }, timeout=5)
         except: pass
 
 def get_config_from_gas():
@@ -33,17 +38,11 @@ def get_config_from_gas():
         return r.json() if r.json().get("status") == "ok" else None
     except: return None
 
-def clear_sheet(sheet_name):
-    if not GAS_WEBAPP_URL: return
-    try:
-        requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "CLEAR", "sheetName": sheet_name}, timeout=10)
-    except: pass
-
 def send_to_gas(sheet_name, rows):
     if not rows or not GAS_WEBAPP_URL: return
     log(f"Отправка {len(rows)} строк в {sheet_name}...")
     try:
-        chunk_size = 3000
+        chunk_size = 2000
         for i in range(0, len(rows), chunk_size):
             chunk = rows[i:i + chunk_size]
             payload = {"secret": SECRET_KEY, "type": "DATA", "sheetName": sheet_name, "rows": chunk}
@@ -51,17 +50,15 @@ def send_to_gas(sheet_name, rows):
             time.sleep(1)
         log("Отправка завершена.")
     except Exception as e:
-        log(f"Сбой отправки: {e}")
+        log(f"Сбой отправки: {e}", "ERR")
 
 def get_headers(cid, key):
-    return {
-        "Client-Id": str(cid).strip(), "Api-Key": str(key).strip(),
-        "Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; OzonVPS/1.0)"
-    }
+    return {"Client-Id": str(cid).strip(), "Api-Key": str(key).strip(), "Content-Type": "application/json"}
 
-# --- 1. ТОВАРЫ (КАРТОЧКИ) ---
+# --- ФУНКЦИИ ЗАГРУЗКИ (СТРОГО ПО ТЗ) ---
+
 def fetch_cards(cid, key, acc_name):
-    log("Загрузка карточек...")
+    log("Загрузка товаров...")
     items = []
     headers = get_headers(cid, key)
     last_id = ""
@@ -86,37 +83,29 @@ def fetch_cards(cid, key, acc_name):
                 pid = int(basic.get("product_id"))
                 full = info_map.get(pid, {})
                 
-                # Поля
-                offer_id = full.get("offer_id") or basic.get("offer_id") or ""
-                ozon_id = str(pid)
+                offer_id = full.get("offer_id") or basic.get("offer_id") or "" # Арт Наш
+                ozon_id = str(pid) # Арт Ozon
                 name = full.get("name") or "Товар"
                 cat = str(full.get("category_id", ""))
-                
-                # Фото
                 primary = full.get("primary_image") or ""
                 if not primary and full.get("images"):
                      imgs = full.get("images")
                      primary = imgs[0] if isinstance(imgs[0], str) else imgs[0].get("file_name", "")
                 
-                # Бренд
                 brand = ""
                 for a in full.get("attributes", []):
-                    if a.get("attribute_id") in [85, 31]: # ID атрибутов бренда
+                    if a.get("attribute_id") in [85, 31]:
                         vals = a.get("values", [])
                         if vals: brand = vals[0].get("value", "")
                         break
                 
-                # Цены
-                # old_price = Цена до скидки
-                # marketing_price = Цена продавца (после скидки ЛК)
-                # price = Цена для покупателя (итоговая)
-                old_p = float(full.get("old_price") or 0)
-                mkt_p = float(full.get("marketing_price") or 0) 
-                buy_p = float(full.get("price") or 0) 
-                # Для цены Ozon Карты точных данных в API нет, берем цену покупателя как ориентир
+                old_p = float(full.get("old_price") or 0)     # До скидки
+                mkt_p = float(full.get("marketing_price") or 0) # ЛК (после скидки)
+                buy_p = float(full.get("price") or 0)           # Покупателя
+                # Цену Ozon Карты берем равной цене покупателя (в API явно нет поля OzonCardPrice для селлера)
                 card_p = buy_p 
 
-                # ПОРЯДОК: [Аккаунт, Фото, Арт.OZ, Арт.Наш, Бренд, Кат, Имя, Ц.До, Ц.ЛК, Ц.Покуп, Ц.Карта]
+                # 1.Фото, 2.АртOZ, 3.АртНаш, 4.Бренд, 5.Кат, 6.Имя, 7.ДоСкидки, 8.ЛК, 9.Покуп, 10.Карта
                 items.append([acc_name, primary, ozon_id, offer_id, brand, cat, name, old_p, mkt_p, buy_p, card_p])
             
             last_item = data[-1]
@@ -125,7 +114,6 @@ def fetch_cards(cid, key, acc_name):
         except: break
     return items
 
-# --- 2. ОСТАТКИ ---
 def fetch_stocks(cid, key, acc_name):
     log("Загрузка остатков...")
     items = []
@@ -134,16 +122,15 @@ def fetch_stocks(cid, key, acc_name):
         r = requests.post("https://api-seller.ozon.ru/v2/analytics/stock_on_warehouses", headers=headers, json={"limit": 1000, "offset": 0})
         rows = r.json().get("result", {}).get("rows", [])
         for row in rows:
-            sku = str(row.get("sku", "")) # Ozon SKU
-            oid = row.get("item_code") or sku # Наш SKU
+            sku = str(row.get("sku", ""))
+            oid = row.get("item_code") or sku # Артикул (Наш)
             for wh in row.get("warehouses", []):
                 if wh.get("item_cnt", 0) > 0:
-                    # ПОРЯДОК: [Аккаунт, Склад, Артикул(Наш), Остаток]
+                    # 1.Склад, 2.Артикул, 3.Остаток
                     items.append([acc_name, wh.get("warehouse_name"), oid, wh.get("item_cnt")])
     except: pass
     return items
 
-# --- 3. ПРОДАЖИ ---
 def fetch_sales(cid, key, date_from, date_to, acc_name):
     log(f"Загрузка продаж ({date_from} - {date_to})...")
     items = []
@@ -166,19 +153,17 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
                 
                 an = p.get("analytics_data") or {}
                 fin = p.get("financial_data") or {}
-                
                 fin_prods = {x.get('product_id'): x for x in fin.get('products', [])}
                 
+                wh_from = an.get("warehouse_name") or "Неизвестно"
+                wh_to = an.get("region") or "Неизвестно"
+
                 for prod in p.get("products", []):
                     sku = prod.get("sku")
                     fp = fin_prods.get(sku, {})
-                    # Цена, которую оплатил покупатель
                     price = float(fp.get('client_price') or prod.get('price') or 0)
                     
-                    wh_from = an.get("warehouse_name") or "Неизвестно"
-                    wh_to = an.get("region") or "Неизвестно" # Склад доставки/Регион
-
-                    # ПОРЯДОК: [Аккаунт, Дата, Тип, Арт.Наш, Арт.OZ, Кол, Цена, СкладОткуда, СкладКуда]
+                    # 1.Дата, 2.Тип, 3.АртНаш, 4.АртOZ, 5.Кол, 6.Цена, 7.СкладОт, 8.СкладДо
                     items.append([acc_name, created, typ, prod.get("offer_id"), str(sku), 1, price, wh_from, wh_to])
             if len(res) < 1000: break
             page += 1
@@ -187,7 +172,7 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
     return items
 
 if __name__ == "__main__":
-    log("=== ЗАПУСК БОТА v122 (DATA FIX) ===")
+    log("=== ЗАПУСК v123 (Server Monitor) ===")
     while True:
         config = get_config_from_gas()
         if not config:
@@ -197,15 +182,17 @@ if __name__ == "__main__":
         
         ACCOUNTS = config.get("accounts", [])
         PERIOD = config.get("period", {})
+        SETTINGS = config.get("settings", {}) # Получаем настройки галочек
+        
         d_f = PERIOD.get("dateFrom", "2024-01-01")
         d_t = PERIOD.get("dateTo", datetime.datetime.now().strftime("%Y-%m-%d"))
 
-        log(f"Задание: {len(ACCOUNTS)} кабинетов. Период: {d_f} - {d_t}")
+        log(f"Задание: {len(ACCOUNTS)} каб. Период: {d_f}-{d_t}")
 
-        # Очистка буферов
-        clear_sheet("OZ_CARDS_PY")
-        clear_sheet("OZ_STOCK_PY")
-        clear_sheet("OZ_SALES_PY")
+        # Предварительная очистка
+        try:
+            requests.post(GAS_WEBAPP_URL, json={"secret":SECRET_KEY, "type":"CLEAR_BUFFERS"}, timeout=10)
+        except: pass
         time.sleep(2)
 
         for acc in ACCOUNTS:
@@ -213,15 +200,21 @@ if __name__ == "__main__":
             cid, key = acc.get('client_id'), acc.get('api_key')
             try:
                 log(f"--> {name}")
-                cards = fetch_cards(cid, key, name)
-                if cards: send_to_gas("OZ_CARDS_PY", cards)
                 
-                stocks = fetch_stocks(cid, key, name)
-                if stocks: send_to_gas("OZ_STOCK_PY", stocks)
+                # Проверяем настройки: грузить ли Товары Ozon?
+                if SETTINGS.get("oz_cards", True):
+                    cards = fetch_cards(cid, key, name)
+                    if cards: send_to_gas("OZ_CARDS_PY", cards)
                 
-                sales = fetch_sales(cid, key, d_f, d_t, name)
-                if sales: send_to_gas("OZ_SALES_PY", sales)
-            except Exception as e: log(f"Ошибка {name}: {e}")
+                if SETTINGS.get("oz_stock", True):
+                    stocks = fetch_stocks(cid, key, name)
+                    if stocks: send_to_gas("OZ_STOCK_PY", stocks)
+                
+                if SETTINGS.get("oz_sales", True):
+                    sales = fetch_sales(cid, key, d_f, d_t, name)
+                    if sales: send_to_gas("OZ_SALES_PY", sales)
+                    
+            except Exception as e: log(f"Ошибка {name}: {e}", "ERR")
         
         log(f"Сон {UPDATE_INTERVAL_HOURS} ч...")
         time.sleep(UPDATE_INTERVAL_HOURS * 3600)
