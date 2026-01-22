@@ -4,7 +4,18 @@ import json
 import datetime
 import os
 import sys
+import ssl
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
 from dotenv import load_dotenv
+
+# --- МАГИЯ 1: МАСКИРОВКА ПОД БРАУЗЕР (SSL/TLS) ---
+class CipherAdapter(HTTPAdapter):
+    def init_poolmanager(self, connections, maxsize, block=False):
+        context = ssl.create_default_context()
+        # Этот набор шифров делает Python похожим на Chrome для защиты Ozon
+        context.set_ciphers('ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384')
+        self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, ssl_context=context)
 
 try:
     import psutil
@@ -19,9 +30,16 @@ SECRET_KEY = os.getenv("SECRET_KEY", "MY_SUPER_SECRET_PASSWORD_123")
 UPDATE_INTERVAL_HOURS = int(os.getenv("UPDATE_INTERVAL_HOURS", 1))
 PROXY_URL = os.getenv("PROXY_URL")
 
+# --- МАГИЯ 2: СБОРКА СЕССИИ (PROXY + SSL) ---
 session = requests.Session()
+
+# 1. Включаем маскировку SSL
+session.mount('https://', CipherAdapter())
+
+# 2. Включаем Прокси
 if PROXY_URL:
     session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+    print(f"--> SYSTEM: Proxy Configured")
 
 def get_server_load():
     if not PSUTIL_OK: return {"cpu": 0, "ram": 0}
@@ -33,17 +51,17 @@ def log(msg, type="LOG_VPS"):
     print(f"[{ts}] {msg}")
     if GAS_WEBAPP_URL:
         try:
+            # Логи отправляем через обычный requests (без прокси), чтобы быстрее
             requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": type, "msg": f"{msg}", "server_info": get_server_load()}, timeout=5)
         except: pass
 
 def check_ip():
     try:
-        # Проверяем реальный IP через прокси
-        r = session.get("https://api.ipify.org?format=json", timeout=10)
+        r = session.get("https://api.ipify.org?format=json", timeout=15)
         ip = r.json().get("ip")
-        log(f"--> SYSTEM: Ваш IP через прокси: {ip}")
-    except Exception as e:
-        log(f"--> SYSTEM: Ошибка проверки IP: {e}", "WARN")
+        log(f"--> SYSTEM: Реальный IP запроса: {ip}")
+    except:
+        log("--> SYSTEM: Не удалось проверить IP (но работаем дальше)")
 
 def get_config_from_gas():
     log("Запрос конфига...")
@@ -67,11 +85,15 @@ def send_to_gas(sheet_name, rows):
     except Exception as e: log(f"Send Fail: {e}", "ERR")
 
 def update_headers(cid, key):
+    session.headers.clear()
     session.headers.update({
         "Client-Id": str(cid).strip(),
         "Api-Key": str(key).strip(),
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Origin": "https://seller.ozon.ru",
+        "Referer": "https://seller.ozon.ru/"
     })
 
 def fetch_cards(cid, key, acc_name):
@@ -81,7 +103,6 @@ def fetch_cards(cid, key, acc_name):
     items = []
     last_id = ""
     
-    # ПЕЧАТАЕМ КЛЮЧ ДЛЯ ПРОВЕРКИ
     masked_key = str(key)[:5] + "..."
     log(f"Товары (Key: {masked_key})...")
     
@@ -91,7 +112,7 @@ def fetch_cards(cid, key, acc_name):
         try:
             r = session.post(URL, json=payload)
             if r.status_code != 200:
-                log(f"Err 404/403. IP в бане или неверная роль ключа (Нужна 'Товары').", "ERR")
+                log(f"Err {r.status_code}. Ответ Ozon: {r.text[:50]}", "ERR")
                 break
             data = r.json().get("result", {}).get("items", [])
             if not data: break
@@ -124,7 +145,9 @@ def fetch_cards(cid, key, acc_name):
             last_item = data[-1]
             last_id = str(last_item.get("product_id"))
             if len(data) < 100: break
-        except: break
+        except Exception as e:
+            log(f"Exception: {e}", "ERR")
+            break
     log(f"Найдено товаров: {len(items)}")
     return items
 
@@ -184,9 +207,7 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
     return items
 
 if __name__ == "__main__":
-    log("=== ЗАПУСК v141 (IP CHECK) ===")
-    
-    # ПРОВЕРКА IP
+    log("=== ЗАПУСК v142 (COMBO: PROXY + SSL) ===")
     check_ip()
 
     while True:
