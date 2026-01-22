@@ -6,7 +6,6 @@ import os
 import sys
 from dotenv import load_dotenv
 
-# Отключаем сложные SSL адаптеры, пробуем просто через Прокси (так надежнее для v1)
 try:
     import psutil
     PSUTIL_OK = True
@@ -73,50 +72,39 @@ def update_headers(cid, key):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     })
 
-# === ГЛАВНАЯ ФУНКЦИЯ ПОИСКА ТОВАРОВ ===
+# === ФУНКЦИЯ ПОИСКА ТОВАРОВ (v144) ===
 def fetch_cards(cid, key, acc_name):
     update_headers(cid, key)
     masked_key = str(key)[:5] + "..."
-    log(f"Ищем товары для {acc_name} (ID: {cid}, Key: {masked_key})...")
+    log(f"Ищем товары для {acc_name} (ID: {cid})...")
     
     items = []
     
-    # СТРАТЕГИЯ 1: v2 standard
+    # !!! ГЛАВНОЕ ИЗМЕНЕНИЕ: Только v2 и ПУСТОЙ ФИЛЬТР !!!
+    # Это обходит баг с "visibility: ALL" на некоторых ключах
     url = "https://api-seller.ozon.ru/v2/product/list"
-    payload = {"filter": {"visibility": "ALL"}, "limit": 100}
     
-    r = None
+    # 1. Сначала пробуем БЕЗ фильтра вообще (самый надежный метод для Admin Read Only)
+    payload = {"filter": {}, "limit": 100}
+    
+    # Тестовый запрос
     try:
         r = session.post(url, json=payload)
-    except Exception as e: log(f"Err connection: {e}", "ERR")
-
-    # Если v2 не сработал (404/403) - пробуем СТРАТЕГИЮ 2
-    if r is None or r.status_code != 200:
-        if r: log(f"v2 (ALL) не прошел ({r.status_code}). Пробуем v2 (Empty)...")
-        
-        # СТРАТЕГИЯ 2: v2 без фильтра
-        payload = {"filter": {}, "limit": 100}
-        try:
+        if r.status_code != 200:
+            log(f"Попытка 1 (Empty Filter) неудачна: {r.status_code}. Пробуем фильтр visibility...", "WARN")
+            # 2. Если не вышло - пробуем с фильтром
+            payload["filter"] = {"visibility": "ALL"}
             r = session.post(url, json=payload)
-        except: pass
-        
-        # Если и это не сработало - СТРАТЕГИЯ 3: Старый добрый v1
-        if r is None or r.status_code != 200:
-            if r: log(f"v2 (Empty) не прошел ({r.status_code}). Пробуем v1 (Legacy)...")
-            url = "https://api-seller.ozon.ru/v1/product/list"
-            payload = {"filter": {}, "limit": 100} 
-            try:
-                r = session.post(url, json=payload)
-            except: pass
-            
-            if r is None or r.status_code != 200:
-                log(f"ВСЕ МЕТОДЫ ПРОВАЛЕНЫ. Проверьте Client-ID! Ответ: {r.text[:100] if r else 'None'}", "ERR")
+            if r.status_code != 200:
+                log(f"КРИТИЧЕСКАЯ ОШИБКА ДОСТУПА: {r.status_code}. Ответ: {r.text[:100]}", "ERR")
                 return []
-    
-    # Если мы тут - значит какой-то url сработал
-    log(f"УСПЕХ! Сработал метод: {url}")
-    
-    # Качаем данные (универсальный цикл)
+    except Exception as e:
+        log(f"Ошибка соединения: {e}", "ERR")
+        return []
+
+    log("Соединение установлено! Качаем список...")
+
+    # Цикл загрузки
     last_id = ""
     while True:
         if last_id: payload["last_id"] = str(last_id)
@@ -125,10 +113,10 @@ def fetch_cards(cid, key, acc_name):
             data = r.json().get("result", {}).get("items", [])
             if not data: break
             
+            # Детали товара
             ids = [int(x.get("product_id")) for x in data]
             info_map = {}
             try:
-                # Детали всегда берем через v2/info - он работает стабильно
                 r_info = session.post("https://api-seller.ozon.ru/v2/product/info/list", json={"product_id": ids})
                 info_map = {i.get("id"): i for i in r_info.json().get("result", {}).get("items", [])}
             except: pass
@@ -163,14 +151,14 @@ def fetch_cards(cid, key, acc_name):
 
 def fetch_stocks(cid, key, acc_name):
     update_headers(cid, key)
-    # Тоже пробуем v3, если нет - v2
-    url = "https://api-seller.ozon.ru/v3/product/info/stocks"
+    # Сначала v2 (надежнее), потом v3
+    url = "https://api-seller.ozon.ru/v2/product/info/stocks"
     payload = {"filter": {}, "limit": 100}
     
     try:
         r = session.post(url, json=payload)
         if r.status_code != 200:
-            url = "https://api-seller.ozon.ru/v2/product/info/stocks"
+            url = "https://api-seller.ozon.ru/v3/product/info/stocks"
             r = session.post(url, json=payload)
             if r.status_code != 200: return []
     except: return []
@@ -218,7 +206,7 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
     return items
 
 if __name__ == "__main__":
-    log("=== ЗАПУСК v143 (OMNIVORE: v1/v2/Filters) ===")
+    log("=== ЗАПУСК v144 (SNIPER: v2 Empty Filter) ===")
     check_ip()
 
     while True:
