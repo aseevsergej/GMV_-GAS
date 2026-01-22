@@ -4,7 +4,18 @@ import json
 import datetime
 import os
 import sys
+import ssl
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
 from dotenv import load_dotenv
+
+# --- TLS FINGERPRINT FIX (Маскировка под браузер) ---
+class CipherAdapter(HTTPAdapter):
+    def init_poolmanager(self, connections, maxsize, block=False):
+        context = ssl.create_default_context()
+        # Ставим шифры как у обычного браузера, чтобы пройти WAF Ozon
+        context.set_ciphers('ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384')
+        self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, ssl_context=context)
 
 try:
     import psutil
@@ -18,7 +29,9 @@ GAS_WEBAPP_URL = os.getenv("GAS_WEBAPP_URL")
 SECRET_KEY = os.getenv("SECRET_KEY", "MY_SUPER_SECRET_PASSWORD_123")
 UPDATE_INTERVAL_HOURS = int(os.getenv("UPDATE_INTERVAL_HOURS", 1))
 
+# Создаем сессию с "правильным" SSL
 session = requests.Session()
+session.mount('https://', CipherAdapter())
 
 def get_server_load():
     if not PSUTIL_OK: return {"cpu": 0, "ram": 0}
@@ -34,7 +47,7 @@ def log(msg, type="LOG_VPS"):
         except: pass
 
 def get_config_from_gas():
-    log("Запрос конфига из Таблицы...")
+    log("Запрос конфига...")
     if not GAS_WEBAPP_URL: return None
     try:
         r = requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "GET_CONFIG"}, timeout=30)
@@ -50,39 +63,43 @@ def send_to_gas(sheet_name, rows):
         for i in range(0, len(rows), chunk_size):
             chunk = rows[i:i + chunk_size]
             requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "DATA", "sheetName": sheet_name, "rows": chunk, "server_info": get_server_load()}, timeout=90)
-            time.sleep(1)
+            time.sleep(1.2)
         log("Отправка завершена.")
     except Exception as e: log(f"Send Fail: {e}", "ERR")
 
+# === ОБНОВЛЕННЫЕ ЗАГОЛОВКИ (ANTI-BAN) ===
 def update_headers(cid, key):
+    session.headers.clear() # Чистим старое
     session.headers.update({
         "Client-Id": str(cid).strip(),
         "Api-Key": str(key).strip(),
         "Content-Type": "application/json",
-        "User-Agent": "PostmanRuntime/7.28.0",
-        "Accept": "*/*",
-        "Connection": "keep-alive"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Origin": "https://seller.ozon.ru",
+        "Referer": "https://seller.ozon.ru/",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
     })
 
 def fetch_cards(cid, key, acc_name):
     update_headers(cid, key)
-    # ПРОВЕРКА КЛЮЧА В ЛОГЕ
-    masked_key = str(key)[:5] + "..."
-    log(f"Товары (Key: {masked_key}): Запуск...")
-    
     URL_LIST = "https://api-seller.ozon.ru/v2/product/list"
     URL_INFO = "https://api-seller.ozon.ru/v2/product/info/list"
+    
+    log(f"Товары: {URL_LIST}")
     items = []
     last_id = ""
     
     while True:
         payload = {"filter": {"visibility": "ALL"}, "limit": 100}
         if last_id: payload["last_id"] = str(last_id)
+        
         try:
             r = session.post(URL_LIST, json=payload)
             if r.status_code != 200:
-                log(f"ERR Товары: {r.status_code}. {r.text[:100]}", "ERR")
+                log(f"Товары Сбой {r.status_code}. Возможно, IP сервера в черном списке Ozon для этого метода.", "ERR")
                 break
+                
             data = r.json().get("result", {}).get("items", [])
             if not data: break
             
@@ -129,9 +146,7 @@ def fetch_stocks(cid, key, acc_name):
         if last_id: payload["last_id"] = str(last_id)
         try:
             r = session.post("https://api-seller.ozon.ru/v3/product/info/stocks", json=payload)
-            if r.status_code != 200:
-                log(f"ERR Остатки: {r.status_code}", "ERR")
-                break
+            if r.status_code != 200: break
             res = r.json().get("result", {})
             data = res.get("items", [])
             if not data: break
@@ -177,47 +192,39 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
     return items
 
 if __name__ == "__main__":
-    log("=== ЗАПУСК v136 (CHECK KEYS) ===")
+    log("=== ЗАПУСК v138 (ANTI-BAN TLS) ===")
     if GAS_WEBAPP_URL:
         try: requests.post(GAS_WEBAPP_URL, json={"secret":SECRET_KEY, "type":"INIT_VPS"}, timeout=5)
         except: pass
 
     while True:
         config = get_config_from_gas()
-        
         now = datetime.datetime.now()
-        d_f = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-        d_t = now.strftime("%Y-%m-%d")
+        d_f, d_t = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")
         src = "АВАРИЙНЫЙ"
-        
-        ACCOUNTS = []
-        SETTINGS = {"oz_cards":True, "oz_stock":True, "oz_sales":True}
+        ACCOUNTS, SETTINGS = [], {"oz_cards":True, "oz_stock":True, "oz_sales":True}
 
         if config:
             ACCOUNTS = config.get("accounts", [])
             p = config.get("period", {})
-            if p and p.get("dateFrom"):
-                d_f, d_t = p.get("dateFrom"), p.get("dateTo")
-                src = "ТАБЛИЦА"
+            if p and p.get("dateFrom"): d_f, d_t = p.get("dateFrom"), p.get("dateTo"); src = "ТАБЛИЦА"
             s = config.get("settings", {})
             if s: SETTINGS = s
-        else:
-            time.sleep(60); continue
+        else: time.sleep(60); continue
 
-        log(f"Период: {d_f} - {d_t} | Источник: {src}")
+        log(f"Период: {d_f}-{d_t} | {src}")
         try: requests.post(GAS_WEBAPP_URL, json={"secret":SECRET_KEY, "type":"CLEAR_BUFFERS"}, timeout=10)
         except: pass
         time.sleep(1)
 
         for acc in ACCOUNTS:
-            name = acc.get('name')
-            cid = acc.get('client_id')
-            key = acc.get('api_key')
+            name, cid, key = acc.get('name'), acc.get('client_id'), acc.get('api_key')
             
-            # --- ВАЖНАЯ ПРОВЕРКА ---
-            log(f"--> {name}. Использую ключ из таблицы: {str(key)[:5]}...")
+            # --- ВАЖНО: ВСТАВЬТЕ СЮДА НОВЫЙ КЛЮЧ ЖЕСТКО ДЛЯ ТЕСТА ЕСЛИ ХОТИТЕ ---
+            # if name == "OZ_INHOUSE": key = "ВАШ_НОВЫЙ_КЛЮЧ"
             
             try:
+                log(f"--> {name} ({str(key)[:5]}...)")
                 if SETTINGS.get("oz_cards", True):
                     data = fetch_cards(cid, key, name)
                     if data: send_to_gas("OZ_CARDS_PY", data)
