@@ -6,20 +6,15 @@ import os
 import sys
 from dotenv import load_dotenv
 
-# Загружаем настройки из .env файла
 load_dotenv()
 
-# ================= НАСТРОЙКИ (ТЕПЕРЬ ИЗ ФАЙЛА) =================
+# НАСТРОЙКИ
 GAS_WEBAPP_URL = os.getenv("GAS_WEBAPP_URL")
 SECRET_KEY = os.getenv("SECRET_KEY", "MY_SUPER_SECRET_PASSWORD_123")
 UPDATE_INTERVAL_HOURS = int(os.getenv("UPDATE_INTERVAL_HOURS", 1))
 
-# Проверка, что настройки загрузились
 if not GAS_WEBAPP_URL:
-    print("ОШИБКА: Не найден файл .env или переменная GAS_WEBAPP_URL!")
-    # Скрипт не остановится, но будет писать ошибку в консоль. 
-    # Логирование на GAS работать не будет без URL.
-# ===============================================================
+    print("CRITICAL: Не задан GAS_WEBAPP_URL в .env")
 
 def log(msg):
     ts = datetime.datetime.now().strftime('%H:%M:%S')
@@ -30,15 +25,13 @@ def log(msg):
         except: pass
 
 def get_config_from_gas():
-    log("Запрос настроек из GAS...")
+    log("Запрос настроек...")
     if not GAS_WEBAPP_URL: return None
     try:
         payload = {"secret": SECRET_KEY, "type": "GET_CONFIG"}
         r = requests.post(GAS_WEBAPP_URL, json=payload, timeout=30)
         return r.json() if r.json().get("status") == "ok" else None
-    except Exception as e:
-        log(f"Ошибка конфига: {e}")
-        return None
+    except: return None
 
 def clear_sheet(sheet_name):
     if not GAS_WEBAPP_URL: return
@@ -66,7 +59,7 @@ def get_headers(cid, key):
         "Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; OzonVPS/1.0)"
     }
 
-# --- ФУНКЦИИ ---
+# --- 1. ТОВАРЫ (КАРТОЧКИ) ---
 def fetch_cards(cid, key, acc_name):
     log("Загрузка карточек...")
     items = []
@@ -92,22 +85,39 @@ def fetch_cards(cid, key, acc_name):
             for basic in data:
                 pid = int(basic.get("product_id"))
                 full = info_map.get(pid, {})
+                
+                # Поля
                 offer_id = full.get("offer_id") or basic.get("offer_id") or ""
                 ozon_id = str(pid)
                 name = full.get("name") or "Товар"
                 cat = str(full.get("category_id", ""))
+                
+                # Фото
                 primary = full.get("primary_image") or ""
                 if not primary and full.get("images"):
                      imgs = full.get("images")
                      primary = imgs[0] if isinstance(imgs[0], str) else imgs[0].get("file_name", "")
+                
+                # Бренд
                 brand = ""
                 for a in full.get("attributes", []):
-                    if a.get("attribute_id") in [85, 31]:
+                    if a.get("attribute_id") in [85, 31]: # ID атрибутов бренда
                         vals = a.get("values", [])
                         if vals: brand = vals[0].get("value", "")
                         break
-                def gp(k): return float(full.get(k) or full.get("price", {}).get(k) or 0)
-                items.append([acc_name, primary, ozon_id, offer_id, brand, cat, name, gp("old_price"), gp("price"), gp("marketing_price"), gp("marketing_price")])
+                
+                # Цены
+                # old_price = Цена до скидки
+                # marketing_price = Цена продавца (после скидки ЛК)
+                # price = Цена для покупателя (итоговая)
+                old_p = float(full.get("old_price") or 0)
+                mkt_p = float(full.get("marketing_price") or 0) 
+                buy_p = float(full.get("price") or 0) 
+                # Для цены Ozon Карты точных данных в API нет, берем цену покупателя как ориентир
+                card_p = buy_p 
+
+                # ПОРЯДОК: [Аккаунт, Фото, Арт.OZ, Арт.Наш, Бренд, Кат, Имя, Ц.До, Ц.ЛК, Ц.Покуп, Ц.Карта]
+                items.append([acc_name, primary, ozon_id, offer_id, brand, cat, name, old_p, mkt_p, buy_p, card_p])
             
             last_item = data[-1]
             last_id = str(last_item.get("product_id"))
@@ -115,6 +125,7 @@ def fetch_cards(cid, key, acc_name):
         except: break
     return items
 
+# --- 2. ОСТАТКИ ---
 def fetch_stocks(cid, key, acc_name):
     log("Загрузка остатков...")
     items = []
@@ -123,14 +134,16 @@ def fetch_stocks(cid, key, acc_name):
         r = requests.post("https://api-seller.ozon.ru/v2/analytics/stock_on_warehouses", headers=headers, json={"limit": 1000, "offset": 0})
         rows = r.json().get("result", {}).get("rows", [])
         for row in rows:
-            sku = str(row.get("sku", ""))
-            oid = row.get("item_code") or sku
+            sku = str(row.get("sku", "")) # Ozon SKU
+            oid = row.get("item_code") or sku # Наш SKU
             for wh in row.get("warehouses", []):
                 if wh.get("item_cnt", 0) > 0:
+                    # ПОРЯДОК: [Аккаунт, Склад, Артикул(Наш), Остаток]
                     items.append([acc_name, wh.get("warehouse_name"), oid, wh.get("item_cnt")])
     except: pass
     return items
 
+# --- 3. ПРОДАЖИ ---
 def fetch_sales(cid, key, date_from, date_to, acc_name):
     log(f"Загрузка продаж ({date_from} - {date_to})...")
     items = []
@@ -148,15 +161,25 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
             if not res: break
             for p in res:
                 created = p.get("created_at", "")[:10]
-                typ = "Отмена" if "cancelled" in str(p.get("status", "")).lower() else "Продажа"
+                status = str(p.get("status", "")).lower()
+                typ = "Отмена" if "cancelled" in status else "Продажа"
+                
                 an = p.get("analytics_data") or {}
                 fin = p.get("financial_data") or {}
+                
                 fin_prods = {x.get('product_id'): x for x in fin.get('products', [])}
+                
                 for prod in p.get("products", []):
                     sku = prod.get("sku")
                     fp = fin_prods.get(sku, {})
+                    # Цена, которую оплатил покупатель
                     price = float(fp.get('client_price') or prod.get('price') or 0)
-                    items.append([acc_name, created, typ, prod.get("offer_id"), str(sku), 1, price, an.get("warehouse_name"), an.get("region")])
+                    
+                    wh_from = an.get("warehouse_name") or "Неизвестно"
+                    wh_to = an.get("region") or "Неизвестно" # Склад доставки/Регион
+
+                    # ПОРЯДОК: [Аккаунт, Дата, Тип, Арт.Наш, Арт.OZ, Кол, Цена, СкладОткуда, СкладКуда]
+                    items.append([acc_name, created, typ, prod.get("offer_id"), str(sku), 1, price, wh_from, wh_to])
             if len(res) < 1000: break
             page += 1
             time.sleep(0.3)
@@ -164,7 +187,7 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
     return items
 
 if __name__ == "__main__":
-    log("=== ЗАПУСК БОТА v121 (ENV) ===")
+    log("=== ЗАПУСК БОТА v122 (DATA FIX) ===")
     while True:
         config = get_config_from_gas()
         if not config:
@@ -179,6 +202,7 @@ if __name__ == "__main__":
 
         log(f"Задание: {len(ACCOUNTS)} кабинетов. Период: {d_f} - {d_t}")
 
+        # Очистка буферов
         clear_sheet("OZ_CARDS_PY")
         clear_sheet("OZ_STOCK_PY")
         clear_sheet("OZ_SALES_PY")
@@ -191,8 +215,10 @@ if __name__ == "__main__":
                 log(f"--> {name}")
                 cards = fetch_cards(cid, key, name)
                 if cards: send_to_gas("OZ_CARDS_PY", cards)
+                
                 stocks = fetch_stocks(cid, key, name)
                 if stocks: send_to_gas("OZ_STOCK_PY", stocks)
+                
                 sales = fetch_sales(cid, key, d_f, d_t, name)
                 if sales: send_to_gas("OZ_SALES_PY", sales)
             except Exception as e: log(f"Ошибка {name}: {e}")
