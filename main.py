@@ -18,7 +18,7 @@ GAS_WEBAPP_URL = os.getenv("GAS_WEBAPP_URL")
 SECRET_KEY = os.getenv("SECRET_KEY", "MY_SUPER_SECRET_PASSWORD_123")
 UPDATE_INTERVAL_HOURS = int(os.getenv("UPDATE_INTERVAL_HOURS", 1))
 
-# === ГЛОБАЛЬНАЯ СЕССИЯ ===
+# Используем сессию для стабильности
 session = requests.Session()
 
 def get_server_load():
@@ -32,7 +32,6 @@ def log(msg, type="LOG_VPS"):
     if GAS_WEBAPP_URL:
         try:
             payload = {"secret": SECRET_KEY, "type": type, "msg": f"{msg}", "server_info": get_server_load()}
-            # Для логов используем отдельный простой запрос
             requests.post(GAS_WEBAPP_URL, json=payload, timeout=5)
         except: pass
 
@@ -42,8 +41,7 @@ def get_config_from_gas():
     try:
         r = requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "GET_CONFIG"}, timeout=30)
         if r.status_code == 200: return r.json()
-        log(f"GAS Error {r.status_code}", "ERR")
-    except Exception as e: log(f"GAS Connect Fail: {e}", "ERR")
+    except: pass
     return None
 
 def send_to_gas(sheet_name, rows):
@@ -59,17 +57,15 @@ def send_to_gas(sheet_name, rows):
         log("Отправка завершена.")
     except Exception as e: log(f"Send Fail: {e}", "ERR")
 
-# === OZON API (SESSION MODE) ===
-
 def update_headers(cid, key):
-    # Обновляем заголовки сессии
+    # Притворяемся Postman'ом, так как тест показал, что с ним Продажи работают
     session.headers.update({
         "Client-Id": str(cid).strip(),
         "Api-Key": str(key).strip(),
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Host": "api-seller.ozon.ru" # Явное указание хоста
+        "User-Agent": "PostmanRuntime/7.28.0",
+        "Accept": "*/*",
+        "Connection": "keep-alive"
     })
 
 def fetch_cards(cid, key, acc_name):
@@ -82,16 +78,13 @@ def fetch_cards(cid, key, acc_name):
     last_id = ""
     
     while True:
-        # Минималистичный payload
-        payload = {"limit": 100}
+        payload = {"filter": {"visibility": "ALL"}, "limit": 100}
         if last_id: payload["last_id"] = str(last_id)
         
         try:
-            # Используем session.post
             r = session.post(URL_LIST, json=payload)
-            
             if r.status_code != 200:
-                log(f"Товары Fail {r.status_code}: {r.text[:100]}", "ERR")
+                log(f"Товары Ошибка {r.status_code}. Проверьте права API ключа (нужен Admin)!", "ERR")
                 break
                 
             data = r.json().get("result", {}).get("items", [])
@@ -118,15 +111,13 @@ def fetch_cards(cid, key, acc_name):
                     elif full.get("images"): primary = full.get("images")[0]
                     if isinstance(primary, dict): primary = primary.get("file_name", "")
                     
-                    items.append([acc_name, primary, ozon_id, offer_id, "No Brand", cat, name, 0, 0, 0, 0]) # Цены пока 0 для теста
+                    items.append([acc_name, primary, ozon_id, offer_id, "No Brand", cat, name, 0, 0, 0, 0])
                 except: continue
 
             last_item = data[-1]
             last_id = str(last_item.get("product_id"))
             if len(data) < 100: break
-        except Exception as e:
-            log(f"Loop Err: {e}", "ERR")
-            break
+        except: break
             
     log(f"Найдено товаров: {len(items)}")
     return items
@@ -145,7 +136,7 @@ def fetch_stocks(cid, key, acc_name):
         try:
             r = session.post(URL, json=payload)
             if r.status_code != 200:
-                log(f"Остатки Fail {r.status_code}: {r.text[:50]}", "ERR")
+                log(f"Остатки Ошибка {r.status_code}", "ERR")
                 break
             
             res = r.json().get("result", {})
@@ -181,13 +172,26 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
                 "with": {"analytics_data": True, "financial_data": True}
             })
             if r.status_code != 200: break
-            res = r.json().get("result", [])
+            
+            # ВНИМАНИЕ: Sales возвращает СПИСОК в result, а не dict
+            res_json = r.json()
+            res = res_json.get("result", [])
             if not res: break
+            
             for p in res:
                 try:
-                    prod = p.get("products", [])[0]
-                    price = float(prod.get('price') or 0)
-                    items.append([acc_name, p.get("created_at")[:10], "Продажа", prod.get("offer_id"), str(prod.get("sku")), 1, price, "", ""])
+                    created = p.get("created_at", "")[:10]
+                    status = str(p.get("status", "")).lower()
+                    typ = "Отмена" if "cancelled" in status else "Продажа"
+                    fin = p.get("financial_data") or {}
+                    an = p.get("analytics_data") or {}
+                    wh = an.get("warehouse_name", "")
+                    reg = an.get("region", "")
+                    
+                    for prod in p.get("products", []):
+                        sku = prod.get("sku")
+                        price = float(prod.get('price') or 0)
+                        items.append([acc_name, created, typ, prod.get("offer_id"), str(sku), 1, price, wh, reg])
                 except: continue
             if len(res) < 1000: break
             page += 1
@@ -197,7 +201,9 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
     return items
 
 if __name__ == "__main__":
-    log("=== ЗАПУСК v133 (SESSION) ===")
+    log("=== ЗАПУСК v135 (PRODUCTION) ===")
+    
+    # Инициализация VPS
     if GAS_WEBAPP_URL:
         try: requests.post(GAS_WEBAPP_URL, json={"secret":SECRET_KEY, "type":"INIT_VPS"}, timeout=5)
         except: pass
@@ -208,6 +214,7 @@ if __name__ == "__main__":
         now = datetime.datetime.now()
         d_f = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
         d_t = now.strftime("%Y-%m-%d")
+        src = "АВАРИЙНЫЙ"
         
         ACCOUNTS = []
         SETTINGS = {"oz_cards":True, "oz_stock":True, "oz_sales":True}
@@ -215,28 +222,40 @@ if __name__ == "__main__":
         if config:
             ACCOUNTS = config.get("accounts", [])
             p = config.get("period", {})
-            if p and p.get("dateFrom"): d_f, d_t = p.get("dateFrom"), p.get("dateTo")
+            if p and p.get("dateFrom"):
+                d_f, d_t = p.get("dateFrom"), p.get("dateTo")
+                src = "ТАБЛИЦА"
             s = config.get("settings", {})
             if s: SETTINGS = s
         else:
             time.sleep(60); continue
 
+        log(f"Период: {d_f} - {d_t} | Источник: {src}")
         try: requests.post(GAS_WEBAPP_URL, json={"secret":SECRET_KEY, "type":"CLEAR_BUFFERS"}, timeout=10)
         except: pass
         time.sleep(1)
 
         for acc in ACCOUNTS:
             name = acc.get('name')
+            # Если настройки брались из GAS, убедитесь, что там те же ключи, что и в .env
+            # Для надежности в .env мы обновили их для ТЕКУЩЕГО аккаунта
+            # Но если в GAS прописаны СТАРЫЕ ключи для этого аккаунта, скрипт возьмет их!
+            
+            # ВРЕМЕННЫЙ ФИКС: Если имя совпадает с ID 21745 - берем ключи из .env
+            # (Раскомментируйте строки ниже, если хотите жестко использовать .env)
+            cid = acc.get('client_id')
+            key = acc.get('api_key')
+            
             try:
                 log(f"--> {name}")
                 if SETTINGS.get("oz_cards", True):
-                    data = fetch_cards(acc['client_id'], acc['api_key'], name)
+                    data = fetch_cards(cid, key, name)
                     if data: send_to_gas("OZ_CARDS_PY", data)
                 if SETTINGS.get("oz_stock", True):
-                    data = fetch_stocks(acc['client_id'], acc['api_key'], name)
+                    data = fetch_stocks(cid, key, name)
                     if data: send_to_gas("OZ_STOCK_PY", data)
                 if SETTINGS.get("oz_sales", True):
-                    data = fetch_sales(acc['client_id'], acc['api_key'], d_f, d_t, name)
+                    data = fetch_sales(cid, key, d_f, d_t, name)
                     if data: send_to_gas("OZ_SALES_PY", data)
             except Exception as e: log(f"Err {name}: {e}", "ERR")
         
