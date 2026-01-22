@@ -39,6 +39,7 @@ def get_config_from_gas():
     try:
         r = requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "GET_CONFIG"}, timeout=30)
         if r.status_code == 200: return r.json()
+        log(f"GAS вернул код {r.status_code}", "ERR")
     except Exception as e: log(f"Err Config: {e}", "ERR")
     return None
 
@@ -55,32 +56,34 @@ def send_to_gas(sheet_name, rows):
         log("Отправка завершена.")
     except Exception as e: log(f"Err Send: {e}", "ERR")
 
-# === ВАЖНО: Добавили User-Agent ===
 def get_headers(cid, key):
+    # УБРАЛИ User-Agent, оставили чистый стандарт
     return {
         "Client-Id": str(cid).strip(), 
         "Api-Key": str(key).strip(), 
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (compatible; OzonMfactorBot/1.0)"
+        "Content-Type": "application/json"
     }
 
+# --- OZON API v131 (Clean) ---
+
 def fetch_cards(cid, key, acc_name):
-    log("Загрузка товаров (v2/product/list)...")
+    URL_LIST = "https://api-seller.ozon.ru/v2/product/list"
+    URL_INFO = "https://api-seller.ozon.ru/v2/product/info/list"
+    
+    log(f"Товары: {URL_LIST}")
     items = []
     headers = get_headers(cid, key)
     last_id = ""
     
-    URL_LIST = "https://api-seller.ozon.ru/v2/product/list"
-    URL_INFO = "https://api-seller.ozon.ru/v2/product/info/list"
-
     while True:
-        payload = {"filter": {"visibility": "ALL"}, "limit": 100}
+        # УБРАЛИ VISIBILITY:ALL, оставили пустой фильтр
+        payload = {"filter": {}, "limit": 100}
         if last_id: payload["last_id"] = str(last_id)
         
         try:
             r = requests.post(URL_LIST, headers=headers, json=payload)
             if r.status_code != 200:
-                log(f"Товары 404/Err? Код: {r.status_code}. Тело: {r.text[:50]}", "ERR")
+                log(f"API Товаров: {r.status_code}. {r.text[:100]}", "ERR")
                 break
                 
             data = r.json().get("result", {}).get("items", [])
@@ -97,47 +100,57 @@ def fetch_cards(cid, key, acc_name):
                 try:
                     pid = int(basic.get("product_id"))
                     full = info_map.get(pid, {})
+                    
                     offer_id = str(full.get("offer_id") or basic.get("offer_id") or "NO_ID")
                     ozon_id = str(pid)
                     name = str(full.get("name") or "Товар")
                     cat = str(full.get("category_id", ""))
+                    
                     primary = ""
                     if full.get("primary_image"): primary = full.get("primary_image")
-                    elif full.get("images"): primary = full.get("images")[0]
+                    elif full.get("images") and len(full.get("images")) > 0: primary = full.get("images")[0]
                     if isinstance(primary, dict): primary = primary.get("file_name", "")
+
+                    brand = "No Brand"
+                    for a in full.get("attributes", []):
+                        if a.get("attribute_id") in [85, 31]:
+                            if a.get("values"): brand = a.get("values")[0].get("value", "")
+                            break
                     
-                    # Цены
                     old_p = float(full.get("old_price") or 0)
                     mkt_p = float(full.get("marketing_price") or 0)
                     buy_p = float(full.get("price") or 0)
 
-                    items.append([acc_name, primary, ozon_id, offer_id, "No Brand", cat, name, old_p, mkt_p, buy_p, buy_p])
+                    items.append([acc_name, primary, ozon_id, offer_id, brand, cat, name, old_p, mkt_p, buy_p, buy_p])
                 except: continue
 
             last_item = data[-1]
             last_id = str(last_item.get("product_id"))
             if len(data) < 100: break
-        except: break
+            
+        except Exception as e:
+            log(f"Сбой цикла товаров: {e}", "ERR")
+            break
             
     log(f"Найдено товаров: {len(items)}")
     return items
 
 def fetch_stocks(cid, key, acc_name):
-    log("Загрузка остатков (v3/product/info/stocks)...")
+    URL_STOCK = "https://api-seller.ozon.ru/v3/product/info/stocks"
+    log(f"Остатки: {URL_STOCK}")
+    
     items = []
     headers = get_headers(cid, key)
     last_id = ""
-    URL_STOCK = "https://api-seller.ozon.ru/v3/product/info/stocks"
     
     while True:
-        # ИСПРАВЛЕНО: для v3 filter должен быть пустым, а не visibility:ALL
         payload = {"filter": {}, "limit": 100}
         if last_id: payload["last_id"] = str(last_id)
 
         try:
             r = requests.post(URL_STOCK, headers=headers, json=payload)
             if r.status_code != 200:
-                log(f"Остатки Err {r.status_code}: {r.text[:50]}", "ERR")
+                log(f"API Остатков: {r.status_code}. {r.text[:100]}", "ERR")
                 break
                 
             res = r.json().get("result", {})
@@ -151,12 +164,15 @@ def fetch_stocks(cid, key, acc_name):
                         st_type = stock.get("type", "")
                         cnt = stock.get("present", 0)
                         if cnt > 0:
-                            items.append([acc_name, f"Ozon {st_type.upper()}", offer_id, cnt])
+                            wh_name = f"Ozon {st_type.upper()}"
+                            items.append([acc_name, wh_name, offer_id, cnt])
                 except: continue
             
             last_id = res.get("last_id", "")
             if not last_id or len(data) < 100: break
-        except: break
+        except Exception as e:
+            log(f"Сбой остатков: {e}", "ERR")
+            break
             
     log(f"Найдено остатков: {len(items)}")
     return items
@@ -177,14 +193,16 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
             if r.status_code != 200: break
             res = r.json().get("result", [])
             if not res: break
+            
             for p in res:
                 try:
                     created = p.get("created_at", "")[:10]
                     status = str(p.get("status", "")).lower()
                     typ = "Отмена" if "cancelled" in status else "Продажа"
-                    fin = p.get("financial_data") or {}
                     an = p.get("analytics_data") or {}
+                    fin = p.get("financial_data") or {}
                     fin_prods = {x.get('product_id'): x for x in fin.get('products', [])}
+                    
                     wh_from = an.get("warehouse_name") or "Неизвестно"
                     wh_to = an.get("region") or "Неизвестно"
                     
@@ -202,7 +220,7 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
     return items
 
 if __name__ == "__main__":
-    log("=== ЗАПУСК v130 (HEADERS FIX) ===")
+    log("=== ЗАПУСК v131 (CLEAN REQ) ===")
     if GAS_WEBAPP_URL:
         try: requests.post(GAS_WEBAPP_URL, json={"secret":SECRET_KEY, "type":"INIT_VPS"}, timeout=10)
         except: pass
@@ -210,11 +228,10 @@ if __name__ == "__main__":
     while True:
         config = get_config_from_gas()
         
-        # Умный дефолт
         now = datetime.datetime.now()
         d_f = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
         d_t = now.strftime("%Y-%m-%d")
-        source_msg = "АВАРИЙНЫЙ (Нет связи)"
+        src = "АВАРИЙНЫЙ"
         
         ACCOUNTS = []
         SETTINGS = {"oz_cards":True, "oz_stock":True, "oz_sales":True}
@@ -224,14 +241,15 @@ if __name__ == "__main__":
             p = config.get("period", {})
             if p and p.get("dateFrom"):
                 d_f, d_t = p.get("dateFrom"), p.get("dateTo")
-                source_msg = "ТАБЛИЦА"
-            SETTINGS = config.get("settings") or SETTINGS
+                src = "ТАБЛИЦА"
+            s = config.get("settings", {})
+            if s: SETTINGS = s
         else:
-            log("Жду конфиг...", "WARN")
+            log("Конфиг недоступен. Жду...", "WARN")
             time.sleep(60)
             continue
 
-        log(f"Период: {d_f} - {d_t} | Источник: {source_msg}")
+        log(f"Период: {d_f} - {d_t} | Источник: {src}")
         
         try: requests.post(GAS_WEBAPP_URL, json={"secret":SECRET_KEY, "type":"CLEAR_BUFFERS"}, timeout=10)
         except: pass
