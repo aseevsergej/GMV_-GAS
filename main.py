@@ -6,33 +6,22 @@ import os
 import sys
 from dotenv import load_dotenv
 
-# Попытка импорта psutil для мониторинга
 try:
     import psutil
     PSUTIL_OK = True
 except ImportError:
     PSUTIL_OK = False
 
-# 1. Загружаем настройки из .env
 load_dotenv()
 
 GAS_WEBAPP_URL = os.getenv("GAS_WEBAPP_URL")
 SECRET_KEY = os.getenv("SECRET_KEY", "MY_SUPER_SECRET_PASSWORD_123")
 UPDATE_INTERVAL_HOURS = int(os.getenv("UPDATE_INTERVAL_HOURS", 1))
-PROXY_URL = os.getenv("PROXY_URL") # Читаем прокси из файла
+PROXY_URL = os.getenv("PROXY_URL")
 
-# 2. Настраиваем Сессию
 session = requests.Session()
-
-# Если прокси указан в .env — подключаем его
 if PROXY_URL:
-    session.proxies = {
-        "http": PROXY_URL,
-        "https": PROXY_URL
-    }
-    print(f"--> SYSTEM: Прокси активирован из .env")
-else:
-    print(f"--> SYSTEM: Работаем БЕЗ прокси (IP сервера)")
+    session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
 
 def get_server_load():
     if not PSUTIL_OK: return {"cpu": 0, "ram": 0}
@@ -44,15 +33,22 @@ def log(msg, type="LOG_VPS"):
     print(f"[{ts}] {msg}")
     if GAS_WEBAPP_URL:
         try:
-            # Логи шлем БЕЗ прокси (через requests напрямую), чтобы не тратить трафик прокси и для скорости
             requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": type, "msg": f"{msg}", "server_info": get_server_load()}, timeout=5)
         except: pass
+
+def check_ip():
+    try:
+        # Проверяем реальный IP через прокси
+        r = session.get("https://api.ipify.org?format=json", timeout=10)
+        ip = r.json().get("ip")
+        log(f"--> SYSTEM: Ваш IP через прокси: {ip}")
+    except Exception as e:
+        log(f"--> SYSTEM: Ошибка проверки IP: {e}", "WARN")
 
 def get_config_from_gas():
     log("Запрос конфига...")
     if not GAS_WEBAPP_URL: return None
     try:
-        # Запрос к Google тоже можно делать напрямую
         r = requests.post(GAS_WEBAPP_URL, json={"secret": SECRET_KEY, "type": "GET_CONFIG"}, timeout=30)
         if r.status_code == 200: return r.json()
     except: pass
@@ -71,7 +67,6 @@ def send_to_gas(sheet_name, rows):
     except Exception as e: log(f"Send Fail: {e}", "ERR")
 
 def update_headers(cid, key):
-    # Заголовки как у браузера
     session.headers.update({
         "Client-Id": str(cid).strip(),
         "Api-Key": str(key).strip(),
@@ -86,7 +81,9 @@ def fetch_cards(cid, key, acc_name):
     items = []
     last_id = ""
     
-    log(f"Товары (v2)...")
+    # ПЕЧАТАЕМ КЛЮЧ ДЛЯ ПРОВЕРКИ
+    masked_key = str(key)[:5] + "..."
+    log(f"Товары (Key: {masked_key})...")
     
     while True:
         payload = {"filter": {"visibility": "ALL"}, "limit": 100}
@@ -94,13 +91,12 @@ def fetch_cards(cid, key, acc_name):
         try:
             r = session.post(URL, json=payload)
             if r.status_code != 200:
-                log(f"Товары Ошибка {r.status_code}. Прокси рабочий? {r.text[:100]}", "ERR")
+                log(f"Err 404/403. IP в бане или неверная роль ключа (Нужна 'Товары').", "ERR")
                 break
             data = r.json().get("result", {}).get("items", [])
             if not data: break
             
             ids = [int(x.get("product_id")) for x in data]
-            # Детали тоже качаем через сессию (через прокси)
             try:
                 r_info = session.post(URL_INFO, json={"product_id": ids})
                 info_map = {i.get("id"): i for i in r_info.json().get("result", {}).get("items", [])}
@@ -128,15 +124,12 @@ def fetch_cards(cid, key, acc_name):
             last_item = data[-1]
             last_id = str(last_item.get("product_id"))
             if len(data) < 100: break
-        except Exception as e:
-            log(f"Сбой загрузки: {e}", "ERR")
-            break
+        except: break
     log(f"Найдено товаров: {len(items)}")
     return items
 
 def fetch_stocks(cid, key, acc_name):
     update_headers(cid, key)
-    URL = "https://api-seller.ozon.ru/v3/product/info/stocks"
     log(f"Остатки (v3)...")
     items = []
     last_id = ""
@@ -144,7 +137,7 @@ def fetch_stocks(cid, key, acc_name):
         payload = {"filter": {}, "limit": 100}
         if last_id: payload["last_id"] = str(last_id)
         try:
-            r = session.post(URL, json=payload)
+            r = session.post("https://api-seller.ozon.ru/v3/product/info/stocks", json=payload)
             if r.status_code != 200: break
             res = r.json().get("result", {})
             data = res.get("items", [])
@@ -191,8 +184,11 @@ def fetch_sales(cid, key, date_from, date_to, acc_name):
     return items
 
 if __name__ == "__main__":
-    log("=== ЗАПУСК v140 (SECURE ENV) ===")
+    log("=== ЗАПУСК v141 (IP CHECK) ===")
     
+    # ПРОВЕРКА IP
+    check_ip()
+
     while True:
         config = get_config_from_gas()
         now = datetime.datetime.now()
@@ -215,7 +211,6 @@ if __name__ == "__main__":
 
         for acc in ACCOUNTS:
             name, cid, key = acc.get('name'), acc.get('client_id'), acc.get('api_key')
-            
             try:
                 log(f"--> {name}")
                 if SETTINGS.get("oz_cards", True):
